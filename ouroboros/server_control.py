@@ -73,6 +73,12 @@ def execute_panic_stop(
         pass
 
     try:
+        from ouroboros.responses_server import stop_responses_server
+        stop_responses_server()
+    except Exception:
+        pass
+
+    try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses
 
         kill_all_tracked_subprocesses()

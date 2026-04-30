@@ -263,6 +263,13 @@ export function initSettings({ state }) {
         applyInputValue('s-a2a-agent-description', s.A2A_AGENT_DESCRIPTION);
         if (s.A2A_MAX_CONCURRENT) applyInputValue('s-a2a-max-concurrent', s.A2A_MAX_CONCURRENT);
         if (s.A2A_TASK_TTL_HOURS) applyInputValue('s-a2a-ttl-hours', s.A2A_TASK_TTL_HOURS);
+        // OpenResponses gateway
+        applyCheckboxValue('s-responses-enabled', s.OUROBOROS_RESPONSES_ENABLED);
+        applyInputValue('s-responses-host', s.OUROBOROS_RESPONSES_HOST);
+        if (s.OUROBOROS_RESPONSES_PORT) applyInputValue('s-responses-port', s.OUROBOROS_RESPONSES_PORT);
+        applyInputValue('s-responses-token', s.OUROBOROS_RESPONSES_TOKEN);
+        if (s.OUROBOROS_RESPONSES_MAX_CONCURRENT) applyInputValue('s-responses-max-concurrent', s.OUROBOROS_RESPONSES_MAX_CONCURRENT);
+        if (s.OUROBOROS_RESPONSES_SESSION_TTL_HOURS) applyInputValue('s-responses-ttl-hours', s.OUROBOROS_RESPONSES_SESSION_TTL_HOURS);
         resetSecretClearFlags(page);
         syncEffortSegments(page);
         syncRuntimeModeBridgeState();
@@ -375,6 +382,12 @@ export function initSettings({ state }) {
             A2A_AGENT_DESCRIPTION: (byId('s-a2a-agent-description')?.value || '').trim(),
             A2A_MAX_CONCURRENT: readInt('s-a2a-max-concurrent', 3),
             A2A_TASK_TTL_HOURS: readInt('s-a2a-ttl-hours', 24),
+            // OpenResponses gateway
+            OUROBOROS_RESPONSES_ENABLED: byId('s-responses-enabled')?.checked ?? false,
+            OUROBOROS_RESPONSES_HOST: (byId('s-responses-host')?.value || '127.0.0.1').trim(),
+            OUROBOROS_RESPONSES_PORT: readInt('s-responses-port', 18789),
+            OUROBOROS_RESPONSES_MAX_CONCURRENT: readInt('s-responses-max-concurrent', 3),
+            OUROBOROS_RESPONSES_SESSION_TTL_HOURS: readInt('s-responses-ttl-hours', 24),
             OPENAI_BASE_URL: byId('s-openai-base-url').value.trim(),
             OPENAI_COMPATIBLE_BASE_URL: byId('s-openai-compatible-base-url').value.trim(),
             CLOUDRU_FOUNDATION_MODELS_BASE_URL: byId('s-cloudru-base-url').value.trim(),
@@ -389,6 +402,7 @@ export function initSettings({ state }) {
         collectSecretValue('s-network-password', body);
         collectSecretValue('s-telegram-token', body);
         collectSecretValue('s-gh-token', body);
+        collectSecretValue('s-responses-token', body);
 
         return body;
     }

@@ -55,6 +55,7 @@ Most AI agents execute tasks. Ouroboros **creates itself.**
 - **Embedded Version Control** — Contains its own local Git repo. Version controls its own evolution. Optional GitHub sync for remote backup.
 - **Local Model Support** — Run with a local GGUF model via llama-cpp-python (Metal acceleration on Apple Silicon, CPU on Linux/Windows).
 - **Telegram Bridge** — Optional bidirectional bridge between the Web UI and Telegram: text, typing/actions, photos, chat binding, and inbound Telegram photos flowing into the same live chat/agent stream.
+- **OpenResponses Gateway** — Optional OpenAI-compatible `/v1/responses` endpoint (OpenClaw flavor) on a separate port (default 18789). Disabled by default. Enable in **Settings → Integrations**, set a strong bearer token, and address Ouroboros as a model: `model: "openclaw"`. Streaming SSE supported, internal tool calls surface as standard `function_call` output items, and `input_image` / `input_file` are accepted as base64 or http(s) URLs (with SSRF guards and MIME allowlists). Sessions persist across requests via `previous_response_id`, the optional `user` field, or the `x-openclaw-session-key` header.
 
 ---
 

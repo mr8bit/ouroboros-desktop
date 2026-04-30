@@ -411,6 +411,44 @@ export function renderSettingsPage() {
                             </div>
                         </div>
                     </div>
+                    <div class="form-section">
+                        <h3>OpenResponses Gateway</h3>
+                        <div class="settings-section-copy">OpenAI-compatible /v1/responses endpoint (OpenClaw flavor). Disabled by default. Requires restart to toggle. Set a strong shared secret — every request must present it as <code>Authorization: Bearer &lt;token&gt;</code>.</div>
+                        <div class="form-row">
+                            <div class="form-field checkbox-field">
+                                <label for="s-responses-enabled">Enable OpenResponses Gateway</label>
+                                <input type="checkbox" id="s-responses-enabled">
+                            </div>
+                        </div>
+                        <div class="form-grid two">
+                            <div class="form-field">
+                                <label for="s-responses-host">Host</label>
+                                <input type="text" id="s-responses-host" placeholder="127.0.0.1">
+                            </div>
+                            <div class="form-field">
+                                <label for="s-responses-port">Port</label>
+                                <input type="number" id="s-responses-port" placeholder="18789">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            ${secretField({
+                                id: 's-responses-token',
+                                settingKey: 'OUROBOROS_RESPONSES_TOKEN',
+                                label: 'Bearer Token',
+                                placeholder: 'Generate a strong secret (e.g. openssl rand -hex 32)'
+                            })}
+                        </div>
+                        <div class="form-grid two">
+                            <div class="form-field">
+                                <label for="s-responses-max-concurrent">Max Concurrent Requests</label>
+                                <input type="number" id="s-responses-max-concurrent" placeholder="3">
+                            </div>
+                            <div class="form-field">
+                                <label for="s-responses-ttl-hours">Session TTL (hours)</label>
+                                <input type="number" id="s-responses-ttl-hours" placeholder="24">
+                            </div>
+                        </div>
+                    </div>
                 </section>
 
                 <section class="settings-panel" data-settings-panel="advanced">

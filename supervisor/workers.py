@@ -149,7 +149,25 @@ def _get_chat_agent():
 
 def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None) -> None:
     with _chat_agent_lock:
-        _handle_chat_direct_locked(chat_id, text, image_data)
+        # Stamp the active chat_id on the bridge so per-chat-id event
+        # subscribers (OpenResponses gateway) can correlate tool/log events
+        # without modifying every emitter to pass chat_id through.
+        bridge = None
+        try:
+            from supervisor.message_bus import try_get_bridge
+            bridge = try_get_bridge()
+            if bridge is not None:
+                bridge.set_active_chat(chat_id)
+        except Exception:
+            log.debug("Failed to set active chat on bridge", exc_info=True)
+        try:
+            _handle_chat_direct_locked(chat_id, text, image_data)
+        finally:
+            if bridge is not None:
+                try:
+                    bridge.clear_active_chat()
+                except Exception:
+                    log.debug("Failed to clear active chat on bridge", exc_info=True)
 
 
 def _handle_chat_direct_locked(chat_id: int, text: str, image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None) -> None:

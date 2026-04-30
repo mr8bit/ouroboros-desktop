@@ -90,6 +90,7 @@ _SECRET_SETTING_KEYS = {
     "TELEGRAM_BOT_TOKEN",
     "GITHUB_TOKEN",
     "OUROBOROS_NETWORK_PASSWORD",
+    "OUROBOROS_RESPONSES_TOKEN",
 }
 
 # ---------------------------------------------------------------------------
@@ -263,6 +264,11 @@ _RESTART_REQUIRED_KEYS = frozenset({
     "A2A_AGENT_DESCRIPTION",
     "A2A_MAX_CONCURRENT",
     "A2A_TASK_TTL_HOURS",
+    # OpenResponses gateway requires restart when toggled or rebound.
+    "OUROBOROS_RESPONSES_ENABLED",
+    "OUROBOROS_RESPONSES_PORT",
+    "OUROBOROS_RESPONSES_HOST",
+    "OUROBOROS_RESPONSES_MAX_CONCURRENT",
 })
 
 
@@ -1713,9 +1719,37 @@ async def lifespan(app):
         except Exception:
             log.warning("Failed to start A2A server", exc_info=True)
 
+    # OpenResponses gateway — disabled by default; enable in Settings → Integrations
+    responses_server_task = None
+    responses_port = int(settings.get("OUROBOROS_RESPONSES_PORT", 18789) or 18789)
+    if settings.get("OUROBOROS_RESPONSES_ENABLED", False):
+        try:
+            from ouroboros.responses_server import start_responses_server
+            responses_server_task = asyncio.create_task(
+                start_responses_server(settings), name="responses-server"
+            )
+            log.info("OpenResponses gateway task created on port %d", responses_port)
+        except Exception:
+            log.warning("Failed to start OpenResponses gateway", exc_info=True)
+
     try:
         yield
     finally:
+        # Stop OpenResponses gateway
+        if responses_server_task:
+            try:
+                from ouroboros.responses_server import stop_responses_server
+                stop_responses_server()
+                responses_server_task.cancel()
+                with suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                    await asyncio.wait_for(responses_server_task, timeout=5)
+                try:
+                    from ouroboros.platform_layer import kill_process_on_port
+                    kill_process_on_port(responses_port)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         # Stop A2A server
         if a2a_server_task:
             try:

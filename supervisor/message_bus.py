@@ -83,6 +83,18 @@ class LocalChatBridge:
         # A2A response subscriptions: {subscription_id: (chat_id, callback)}
         self._response_subs: Dict[str, tuple] = {}
         self._response_subs_lock = threading.Lock()
+        # Per-chat-id event subscriptions for the OpenResponses gateway:
+        # {subscription_id: (chat_id, callback)}.  Callback receives every
+        # event (chat / log / typing / photo) routed to that chat_id while
+        # ``handle_chat_direct`` is processing a turn for it.  These are
+        # additive — the existing ``_broadcast_fn`` UI broadcast is unaffected.
+        self._chat_event_subs: Dict[str, tuple] = {}
+        self._chat_event_subs_lock = threading.Lock()
+        # Active chat_id of the currently-running ``handle_chat_direct`` turn.
+        # supervisor.workers serializes those calls behind ``_chat_agent_lock``
+        # so this is effectively a singleton at any moment.  Used to stamp log
+        # events that don't carry chat_id natively (tool_call_started etc).
+        self._active_chat_id: Optional[int] = None
         self._telegram_bot_token = ""
         self._telegram_chat_id: int = 0
         self._telegram_active_chat_id: int = 0
@@ -181,6 +193,54 @@ class LocalChatBridge:
         """Remove a response subscription."""
         with self._response_subs_lock:
             self._response_subs.pop(subscription_id, None)
+
+    def subscribe_chat_events(self, chat_id: int, callback) -> str:
+        """Subscribe to every event (chat / log / typing / photo) for a chat_id.
+
+        Used by the OpenResponses gateway (``ouroboros.responses_executor``) to
+        watch tool_call_started / tool_call_finished events of an in-flight
+        turn so they can be surfaced as standard ``function_call`` SSE items.
+        Callback signature: ``cb(payload: dict) -> None``.
+        """
+        import uuid as _uuid
+        sub_id = _uuid.uuid4().hex
+        with self._chat_event_subs_lock:
+            self._chat_event_subs[sub_id] = (int(chat_id), callback)
+        return sub_id
+
+    def unsubscribe_chat_events(self, subscription_id: str) -> None:
+        with self._chat_event_subs_lock:
+            self._chat_event_subs.pop(subscription_id, None)
+
+    def set_active_chat(self, chat_id: int) -> None:
+        """Mark the chat_id whose turn is currently running.
+
+        Called by ``supervisor.workers._handle_chat_direct_locked`` while it
+        holds ``_chat_agent_lock``.  ``push_log`` reads this to stamp tool/log
+        events that don't carry chat_id natively, so chat-event subscribers
+        receive only events from their own turn.
+        """
+        self._active_chat_id = int(chat_id) if chat_id is not None else None
+
+    def clear_active_chat(self) -> None:
+        self._active_chat_id = None
+
+    def _fan_out_chat_event(self, chat_id: int, payload: dict) -> None:
+        """Deliver one event to every chat-event subscriber matching chat_id."""
+        if chat_id is None:
+            return
+        try:
+            cid = int(chat_id)
+        except (TypeError, ValueError):
+            return
+        with self._chat_event_subs_lock:
+            subs = [(sid, cb) for sid, (sub_chat_id, cb) in self._chat_event_subs.items()
+                    if sub_chat_id == cid]
+        for sid, cb in subs:
+            try:
+                cb(payload)
+            except Exception:
+                log.debug("chat-event subscriber %s raised", sid, exc_info=True)
 
     def shutdown(self) -> None:
         self._stop_telegram_polling()
@@ -517,6 +577,17 @@ class LocalChatBridge:
                 cb(clean_text)
             except Exception:
                 log.debug("A2A response callback error for sub %s", sid, exc_info=True)
+        # Notify per-chat-id event subscribers (OpenResponses gateway).
+        self._fan_out_chat_event(chat_id, {
+            "type": "chat",
+            "role": "assistant",
+            "content": clean_text,
+            "markdown": bool(parse_mode),
+            "is_progress": bool(is_progress),
+            "ts": message_ts,
+            "task_id": str(task_id or ""),
+            "chat_id": int(chat_id),
+        })
         # Skip WebSocket broadcast for A2A virtual chat_ids (negative values)
         if self._broadcast_fn and chat_id >= 0:
             self._broadcast_fn({
@@ -536,6 +607,11 @@ class LocalChatBridge:
         self._outbox.put({
             "type": "action",
             "content": action,
+        })
+        self._fan_out_chat_event(chat_id, {
+            "type": "typing",
+            "action": action,
+            "chat_id": int(chat_id) if chat_id is not None else None,
         })
         if self._broadcast_fn:
             self._broadcast_fn({"type": "typing", "action": action})
@@ -588,6 +664,15 @@ class LocalChatBridge:
                 self._log_queue.put_nowait(event)
             except queue.Full:
                 pass
+        # Per-chat-id event fan-out (OpenResponses gateway).  Tool execution
+        # events do not carry chat_id natively; we stamp them with the
+        # currently-active chat_id captured by handle_chat_direct.
+        chat_id = event.get("chat_id") if isinstance(event, dict) else None
+        if chat_id is None:
+            chat_id = self._active_chat_id
+        if chat_id is not None:
+            payload = {"type": "log", "data": event, "chat_id": int(chat_id)}
+            self._fan_out_chat_event(chat_id, payload)
         if self._broadcast_fn:
             self._broadcast_fn({"type": "log", "data": event})
 
