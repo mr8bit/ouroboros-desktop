@@ -201,12 +201,22 @@ def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
     if include_volatile:
         scratchpad_raw = memory.load_scratchpad()
         _warn_if_over_budget("scratchpad", scratchpad_raw)
-        sections.append("## Scratchpad\n\n" + scratchpad_raw)
+        # Annotate the header so the agent knows scratchpad is already in
+        # context — re-reading via repo_read("scratchpad.md") or data_read
+        # wastes rounds. Companion guard: tools/core.py::_repo_read returns
+        # a NOT_FOUND hint when the agent tries it anyway.
+        sections.append(
+            "## Scratchpad (from `memory/scratchpad.md` — already loaded; "
+            "do not re-read via repo_read or data_read)\n\n" + scratchpad_raw
+        )
 
     if include_stable:
         identity_raw = memory.load_identity()
         _warn_if_over_budget("identity", identity_raw)
-        sections.append("## Identity\n\n" + identity_raw)
+        sections.append(
+            "## Identity (from `memory/identity.md` — already loaded; "
+            "do not re-read via repo_read or data_read)\n\n" + identity_raw
+        )
 
     try:
         from ouroboros.consolidator import migrate_dialogue_summary_to_blocks
@@ -871,11 +881,27 @@ from ouroboros.context_compaction import (
 
 
 def safe_read(path: pathlib.Path, fallback: str = "") -> str:
-    """Read a file, returning fallback if it doesn't exist or errors."""
+    """Read a file, returning fallback if it doesn't exist or errors.
+
+    Distinguishes "file doesn't exist" (DEBUG) from "file exists but
+    unreadable" (WARNING). For critical files (BIBLE.md, identity.md,
+    ARCHITECTURE.md), an empty value is indistinguishable from "file
+    doesn't exist", so the agent silently runs without its constitutional
+    core when the file is corrupt or has bad permissions. Surface the
+    real-infrastructure-problem case at WARNING.
+    """
     try:
-        if path.exists():
-            return read_text(path)
+        exists = path.exists()
     except Exception:
-        log.debug(f"Failed to read file {path} in safe_read", exc_info=True)
-        pass
-    return fallback
+        log.debug("safe_read: path.exists() raised for %s", path, exc_info=True)
+        return fallback
+    if not exists:
+        return fallback
+    try:
+        return read_text(path)
+    except Exception as exc:
+        log.warning(
+            "safe_read: file %s exists but read failed (%s: %s); using fallback",
+            path, type(exc).__name__, exc,
+        )
+        return fallback

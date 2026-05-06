@@ -1,4 +1,5 @@
 import { escapeHtml, renderMarkdown } from './utils.js';
+import { renderPageHeader } from './page_header.js';
 import {
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -10,6 +11,7 @@ const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_INPUT_HISTORY_KEY = 'ouro_chat_input_history';
 const CHAT_SESSION_ID_KEY = 'ouro_chat_session_id';
 const PLAN_PREFIX = 'Please do multi-model planning (plan_task tool) and web-search before answering or starting this task:\n\n';
+const CHAT_ICON = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/><path d="M7 11h10"/><path d="M7 15h6"/><path d="M7 7h8"/></svg>';
 
 function getOrCreateChatSessionId() {
     try {
@@ -40,7 +42,7 @@ function saveInputHistory(entries) {
     } catch {}
 }
 
-export function initChat({ ws, state, updateUnreadBadge }) {
+export function initChat({ ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab }) {
     const container = document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
 
@@ -48,25 +50,28 @@ export function initChat({ ws, state, updateUnreadBadge }) {
     page.id = 'page-chat';
     page.className = 'page active';
     page.innerHTML = `
-        <div class="page-header chat-page-header">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 17a2 2 0 0 1-2 2H6.828a2 2 0 0 0-1.414.586l-2.202 2.202A.71.71 0 0 1 2 21.286V5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2z"/><path d="M7 11h10"/><path d="M7 15h6"/><path d="M7 7h8"/></svg>
-            <h2>Chat</h2>
-            <div class="spacer"></div>
-            <div class="chat-header-actions" id="chat-header-actions">
-                <button class="chat-header-btn" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
-                <button class="chat-header-btn" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
-                <button class="chat-header-btn" type="button" data-chat-command="review" title="Run review now">Review</button>
-                <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
-                <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
-            </div>
-            <div class="chat-budget-pill" id="chat-budget-pill" title="Budget">
-                <span class="chat-budget-text" id="chat-budget-text">$0 / $0</span>
-                <div class="chat-budget-bar">
-                    <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
+        ${renderPageHeader({
+            title: 'Chat',
+            icon: CHAT_ICON,
+            variant: 'overlay',
+            className: 'chat-page-header',
+            actionsHtml: `
+                <div class="chat-header-actions" id="chat-header-actions">
+                    <button class="chat-header-btn" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
+                    <button class="chat-header-btn" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
+                    <button class="chat-header-btn" type="button" data-chat-command="review" title="Run review now">Review</button>
+                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
+                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
                 </div>
-            </div>
-            <span id="chat-status" class="status-badge offline">Connecting...</span>
-        </div>
+                <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
+                    <span class="chat-budget-text" id="chat-budget-text">$0 / $0</span>
+                    <div class="chat-budget-bar">
+                        <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
+                    </div>
+                </button>
+                <span id="chat-status" class="status-badge offline">Connecting...</span>
+            `,
+        })}
         <div id="chat-messages"></div>
         <div id="chat-input-area">
             <div id="chat-attachment-preview" class="chat-attachment-preview"></div>
@@ -99,6 +104,7 @@ export function initChat({ ws, state, updateUnreadBadge }) {
 
     const messagesDiv = document.getElementById('chat-messages');
     const input = document.getElementById('chat-input');
+    const inputArea = document.getElementById('chat-input-area');
     const sendBtn = document.getElementById('chat-send');
     const chevronBtn = document.getElementById('chat-send-chevron');
     const sendDropdown = document.getElementById('chat-send-dropdown');
@@ -106,6 +112,7 @@ export function initChat({ ws, state, updateUnreadBadge }) {
     const dropdownPlan = document.getElementById('chat-dropdown-plan');
     const statusBadge = document.getElementById('chat-status');
     const headerActions = document.getElementById('chat-header-actions');
+    const budgetPill = document.getElementById('chat-budget-pill');
     const attachBtn = document.getElementById('chat-attach');
     const fileInput = document.getElementById('chat-file-input');
     const attachmentPreview = document.getElementById('chat-attachment-preview');
@@ -358,7 +365,7 @@ export function initChat({ ws, state, updateUnreadBadge }) {
     }
 
     function isTerminalTaskPhase(phase = '') {
-        return phase === 'done';
+        return phase === 'done' || phase === 'lifecycle_error';
     }
 
     function createTaskUiState(taskId) {
@@ -1436,10 +1443,13 @@ export function initChat({ ws, state, updateUnreadBadge }) {
             restoreInputHistory(1);
         }
     });
-    // Dynamically adjust #chat-messages padding-bottom to match the real height of
-    // the absolute-positioned #chat-input-area overlay, so the last bubble is always
-    // fully visible with a small buffer — no more excessive gap or hidden content.
-    const inputArea = document.getElementById('chat-input-area');
+    // v5.7.0+: #chat-input-area is an absolute-positioned translucent overlay.
+    // The bottom reserve is dynamic via --chat-input-reserve so normal
+    // one-line composition does not leave a huge blank gap, while multiline
+    // textareas / attachment preview still reserve enough scroll space.
+    // We set a CSS variable (not paddingBottom directly) so the design-system
+    // "no separate fade layer" rule remains intact and CSS owns the actual
+    // padding expression, including mobile safe-area.
     function scrollToBottom() {
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
@@ -1454,16 +1464,11 @@ export function initChat({ ws, state, updateUnreadBadge }) {
     function updateMessagesPadding(options = {}) {
         const preserveStickiness = options.preserveStickiness !== false;
         const shouldStick = preserveStickiness && isNearBottom(160);
-        const h = inputArea ? inputArea.offsetHeight : 84;
-        messagesDiv.style.paddingBottom = (h + 16) + 'px';
+        if (inputArea && messagesDiv) {
+            const reserve = Math.max(92, Math.ceil(inputArea.offsetHeight || 0) + 16);
+            messagesDiv.style.setProperty('--chat-input-reserve', `${reserve}px`);
+        }
         if (shouldStick) scrollToBottomAfterLayout();
-    }
-
-    if (window.ResizeObserver && inputArea) {
-        // Composer height changes come from typing/attachment staging; avoid
-        // forcing the transcript while the user is editing on a soft keyboard.
-        const inputResizeObserver = new ResizeObserver(() => updateMessagesPadding({ preserveStickiness: false }));
-        inputResizeObserver.observe(inputArea);
     }
 
     input.addEventListener('input', () => {
@@ -1498,6 +1503,11 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         if (command === 'panic' && confirm('Kill all workers immediately?')) {
             ws.send({ type: 'command', cmd: '/panic' });
         }
+    });
+
+    budgetPill?.addEventListener('click', () => {
+        if (typeof openDashboardTab === 'function') openDashboardTab('costs');
+        else if (typeof openSettingsTab === 'function') openSettingsTab('costs');
     });
 
     refreshHeaderControlState(true);

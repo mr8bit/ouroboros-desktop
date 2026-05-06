@@ -90,10 +90,10 @@ Not every layer is required for every operation. Simple cases (e.g., `repo_read`
 Derived from P7 (Minimalism): entire codebase fits in one context window.
 
 - Module target: ~1000 lines. Crossing that line is P7 pressure and should trigger extraction or an explicit justification.
-- Module hard gate: 1600 lines for non-grandfathered modules in `tests/test_smoke.py`. Grandfathered (`GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`): `llm.py`, `claude_advisory_review.py`, `review_state.py` — split deferred until each surface stabilises.
+- Module hard gate: 1600 lines for non-grandfathered modules in `tests/test_smoke.py`. Grandfathered (`GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`): `llm.py`, `claude_advisory_review.py`, `review_state.py`, `server.py`, and temporary v5.7.1 debt `git.py` — split deferred until each surface stabilises, with `git.py` expected to pay down in the next tools pass.
 - Method target: <150 lines. Crossing that line is a decomposition signal, not an automatic failure by itself.
 - Method hard gate: 300 lines in `tests/test_smoke.py`.
-- Codebase-wide function-count hard gate: enforced by `tests/test_smoke.py` against the value defined in `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (single source of truth — bump the constant when adding a feature with an explicit comment justifying the increase).
+- Codebase-wide function-count hard gate: enforced by `tests/test_smoke.py` against the value defined in `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (currently 2000; single source of truth — bump the constant when adding a feature with an explicit comment justifying the increase).
 - Function parameters: <8.
 - Net complexity growth per cycle approaches zero.
 - If a feature is not used in the current cycle — it is premature.
@@ -215,7 +215,7 @@ Before every commit, verify the following:
 #### Module Size & Complexity
 - [ ] Module stays near one context window (~1000 lines target; 1600 hard gate unless explicitly grandfathered debt)
 - [ ] No method exceeds the practical target (150 lines) or the hard gate (300 lines)
-- [ ] Total Python function count stays under the current smoke hard gate (consult `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` for the active value; bump with a comment if a feature requires more headroom)
+- [ ] Total Python function count stays under the current smoke hard gate (currently 2000; consult `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` for the active value; bump with a comment if a feature requires more headroom)
 - [ ] No function has more than 8 parameters
 - [ ] No gratuitous abstract layers (Bible P7)
 
@@ -225,7 +225,7 @@ Before every commit, verify the following:
 - [ ] New memory/data files? Should they appear in LLM context (`context.py`)?
 
 #### LLM Call Rules
-- [ ] New LLM calls go through the shared `LLMClient` / `llm.py` layer — no ad-hoc HTTP clients or direct provider SDKs outside that layer.
+- [ ] New LLM calls go through the shared `LLMClient` / `llm.py` layer — no ad-hoc HTTP clients or direct provider SDKs outside that layer. **Exception (v5.7.0+):** skill / extension `plugin.py` modules may call providers directly because they have not yet been migrated to a host-mediated `api.invoke_llm(...)` bridge. When that bridge lands, the exception goes away. Runtime callers (anything inside `ouroboros/`) must still use `LLMClient`.
 
 #### Loop / State-Machine Changes
 - [ ] Changes to `loop.py` or other task state-machine logic include adversarial tests for malformed output, false-completion prevention, replay/log durability, and failure modes — not just the happy path.
@@ -289,10 +289,63 @@ backdrop-filter: blur(8–16px);
 border: 1px solid rgba(255, 255, 255, 0.06–0.12);
 ```
 
-Floating chat chrome that overlaps transcript text (header, status badge, attachment
-preview, input dock) must keep enough opacity or blur in the text-bearing zones that
-underlying message text cannot read through labels. Do not add bottom transcript
-fade overlays; keep the last message readable and reserve space with layout/padding.
+### Floating overlay transparency (v5.7.0+)
+
+Floating chrome that overlays scrolling content (chat header, sticky tab
+strips inside Settings/Dashboard/Skills, files preview gradient) follows ONE
+shared formula and never relies on a separate fade-overlay element:
+
+1. The chrome element is `position: absolute` with the appropriate edge
+   (`top: 0` for headers, `bottom: 0` for bottom overlays, etc.) and
+   covers the whole horizontal axis.
+2. Its background is a **single 4-stop linear gradient** that fades from
+   the dense brand background at the chrome's anchor edge to fully
+   transparent at the opposite edge.
+3. `backdrop-filter: blur(10–14px)` is applied on the same element
+   (the host always supplies `-webkit-` prefix in lockstep).
+4. **A CSS `mask-image` matching the gradient direction fades the blur
+   in lockstep**: `mask-image: linear-gradient(0deg, black 0%, black 70%, transparent 100%)`.
+   This is the rule that prevents the visible "glass edge" the v5.6.x
+   chat dock had — without the mask the blur creates its own hard
+   horizontal line at the gradient's transparent stop.
+5. The scrollable surface reserves enough top/bottom padding so content is
+   reachable outside the overlay's dense zone.
+
+**Chat input dock exception:** the bottom composer intentionally splits the
+formula. `#chat-input-area` is a compact absolute bottom overlay with a
+darkening gradient only (no wrapper `backdrop-filter`), so message text fades
+under the dock without a tall smeared blur band. The active textarea itself
+is the frosted surface (`background: rgba(26,21,32,0.55);
+backdrop-filter: blur(20px)`). `#chat-messages` reserves bottom padding
+through `--chat-input-reserve`, which JS sets from the actual dock height
+plus a small buffer; mobile adds safe-area on top of that.
+`updateMessagesPadding()`
+preserves scroll stickiness only; it must not mutate DOM padding.
+
+Do NOT introduce a separate `.chat-bottom-fade` (or analogous overlay)
+layer. A second fade layer compounds the gradient and can produce a visible
+"double dim" especially over short messages.
+
+### Navigation rail spacing (v5.7.0+)
+
+The desktop `#nav-rail` uses Material 3 / Apple HIG navigation-rail
+spacing norms: `padding: 28px 0 16px; gap: 10px;`. The previous
+`12px / 4px` was visibly cramped (the first button hugged the top edge
+of the viewport). Bump these values together when adding new nav
+buttons; resist tightening them.
+
+On mobile (`@media (max-width: 640px)`) the rail flips to a horizontal
+bottom bar with `justify-content: safe center`. The `safe` keyword
+keeps the row centered when content fits and gracefully degrades to
+flex-start when content overflows on very narrow phones. `min-width:
+60px` per `.nav-btn` keeps labels like "Dashboard" from truncating in
+space-evenly mode.
+
+The mobile `.scroll-tabs` pattern (settings/dashboard/skills) uses
+horizontal-scroll pills with `scrollIntoView({ inline: 'center' })`
+on activation so the active pill is always visible. Do not reintroduce
+the v5.6.0 drill-down accordion (`settings-subtab-open` /
+`settings-mobile-back`) — it traded one tap for two.
 
 ### Accent colors
 
@@ -326,6 +379,30 @@ active: background rgba(201,53,69, 0.12) + crimson glow
 focus:  border-color rgba(232,93,111,0.4) + box-shadow 0 0 0 3px rgba(201,53,69,0.10)
 ```
 
+### Button conventions
+
+All normal application buttons use the shared `.btn` base class plus exactly
+one semantic variant:
+
+| Variant | Purpose |
+|---------|---------|
+| `.btn-primary` | Primary action in the current surface: enable, install, update, start |
+| `.btn-secondary` | Neutral secondary action next to a primary action: reload, cancel, install runtime |
+| `.btn-default` | Low-emphasis utility action: refresh, details, open related view |
+| `.btn-ghost` | Very quiet action on an already-strong surface |
+| `.btn-save` | Persist settings or budget changes |
+| `.btn-danger` | Destructive or emergency action |
+
+Size modifiers are `.btn-xs`, `.btn-sm`, `.btn-md`, and `.btn-lg`. Omit a size
+modifier for the default medium size. Do not combine semantic variants (for
+example, `.btn-default.btn-primary` is invalid), and do not invent one-off
+button schemes in feature modules. Onboarding and modal buttons use the same
+`.btn` variants as the main SPA.
+
+Buttons are horizontally centered by default. If a control intentionally uses a
+menu-row layout, use a named menu-item class (for example `.skills-menu-item`)
+rather than overloading `.btn`.
+
 ### "Working" phase color
 
 Use **crimson** (`rgba(248, 130, 140, ...)`) for active/working states everywhere — not blue.
@@ -336,21 +413,30 @@ The Logs page phase badges now match Chat live card colors.
 JS modules that generate HTML must use CSS class names, not `style=""` attributes.
 This is enforced by reviewer policy — `.style.*` assignments on DOM elements (e.g.
 `element.style.display`, `element.style.color`) will produce a REVIEW_BLOCKED finding.
-Existing classes (`.stat-card`, `.page-header`, `.about-*`, `.costs-*`) cover common layouts.
+Existing classes (`.stat-card`, `.page-header`, `.app-page-*`, `.app-tab-*`, `.about-*`, `.costs-*`) cover common layouts.
+For new top-level pages, prefer `web/modules/page_header.js` over bespoke header/tab markup.
 Add new classes to `web/style.css` when needed.
 Before staging any `web/modules/*.js` file: `grep -n "\.style\." web/modules/*.js`
 and fix any hits.
 
 ### Declarative widget UI
 
-Extension widgets must use host-owned declarative render schemas, not
-skill-provided JavaScript. `web/modules/widgets.js` is the single host for
-`register_ui_tab` declarations: legacy `iframe` remains sandboxed with no
-relaxed tokens, legacy `inline_card` remains weather-shaped, and
-`kind: "declarative"` / `schema_version: 1` covers forms, actions, markdown,
-JSON, key/value summaries, tables, progress, files, galleries, and
-image/audio/video media. New widget capabilities should extend that schema and
-its tests rather than adding per-skill renderer modules.
+Extension widgets should prefer host-owned declarative render schemas.
+`web/modules/widgets.js` is the single host for `register_ui_tab`
+declarations: legacy `iframe` remains sandboxed with no relaxed tokens,
+legacy `inline_card` remains weather-shaped, and `kind: "declarative"` /
+`schema_version: 1` covers forms, actions, markdown, JSON, key/value
+summaries, tables, progress, files, galleries, image/audio/video media, and
+v5.7.0 map/calendar/kanban components. New common widget capabilities should
+extend that declarative schema and its tests.
+
+v5.7.0 adds one deliberate exception for rare custom UI: `kind: "module"`
+loads reviewed skill-provided `widget.js` into a sandboxed `srcdoc` iframe
+(`sandbox="allow-scripts"`, **no** `allow-same-origin`). The parent host
+fetches the reviewed JS from `/api/extensions/<skill>/module/<entry>` and
+injects a constrained `fetch` bridge that only proxies
+`/api/extensions/<skill>/...` routes. This is not same-origin SPA execution;
+the module cannot access app cookies or `localStorage`.
 
 Rules for widget changes:
 
@@ -358,13 +444,43 @@ Rules for widget changes:
   markdown blocks.
 - Media sources must be extension routes under `/api/extensions/<skill>/...`
   or explicitly safe `data:` URLs for image/audio/video MIME types.
+- Long-running user actions (image/music/research generation) must use the
+  declarative async job contract: start route returns `job_id`, status route
+  returns `queued|running|done|error`, and the widget host resumes polling by
+  `job_id` after tab switches. Do not implement long generation as a single
+  foreground HTTP request that can be lost when the widget remounts.
+- Download controls must use the host download helper (`data-widget-download-url`
+  / desktop bridge / fetch-blob fallback). Raw in-app navigation links are not
+  acceptable for downloads because desktop WebView may replace the Ouroboros UI
+  with the media file.
 - Do not load arbitrary JS modules from skill directories into the SPA origin.
+  `kind: "module"` is allowed only through the sandboxed iframe + parent fetch
+  bridge above, and must be covered by the `widget_module_safety` review item.
 - Add/update `tests/test_widgets_ui_static.py` for every new component kind or
   media policy.
 
 ---
 
 ## Build & CI
+
+### Pytest marker lanes
+
+Default local pytest excludes costly or environment-dependent lanes:
+`integration`, `browser`, `ui_browser`, `ui_browser_docker`, and
+`portable_detail`. CI opts into them explicitly:
+
+- `integration` runs real provider checks, including Cloud.ru when
+  `CLOUDRU_FOUNDATION_MODELS_API_KEY` is configured.
+- `browser` launches real Playwright Chromium for agent browser tools.
+- `ui_browser` launches the host-side web UI under Playwright.
+- `ui_browser_docker` talks to an `ouroboros-web:test` container and must
+  skip cleanly when Docker is unavailable locally.
+- `portable_detail` covers build/portable artifact invariants and also runs
+  inside Docker in the manual/tag CI tier.
+
+When adding a new opt-in lane, register the marker in `pyproject.toml`, add
+a collect-only zero-test guard in CI, and keep the default local addopts
+token-safe and Docker-safe.
 
 ### GitHub Actions: secrets in step-level `if:` conditions
 

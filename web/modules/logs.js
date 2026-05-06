@@ -10,7 +10,7 @@ import {
     summarizeLogEvent,
 } from './log_events.js';
 
-export function initLogs({ ws, state }) {
+export function initLogs({ ws, state, mount = null, embedded = false, hostPage = 'settings', hostSubtab = 'logs' }) {
     const MAX_LOGS = 500;
     const MAX_TASK_EVENTS = 30;
     const duplicateWindowMs = 5000;
@@ -23,25 +23,40 @@ export function initLogs({ ws, state }) {
 
     const page = document.createElement('div');
     page.id = 'page-logs';
-    page.className = 'page';
-    page.innerHTML = `
+    page.className = embedded ? 'settings-embedded-content settings-logs-panel' : 'page';
+    // v5.7.0: when embedded inside the Dashboard tab strip, skip the inner
+    // .page-header (the outer Dashboard header + tab pill already labels the
+    // panel — drawing another "Logs" h2 here wasted ~44px of fixed vertical
+    // space on every viewport). The Clear button moves into the filter row.
+    const headerBlock = embedded
+        ? ''
+        : `
         <div class="page-header">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
             <h2>Logs</h2>
             <div class="spacer"></div>
             <button class="btn btn-default" id="btn-clear-logs">Clear</button>
-        </div>
-        <div class="logs-filters" id="log-filters"></div>
+        </div>`;
+    const inlineClear = embedded
+        ? `<button class="btn btn-default logs-inline-clear" id="btn-clear-logs">Clear</button>`
+        : '';
+    page.innerHTML = `
+        ${headerBlock}
+        <div class="logs-filters" id="log-filters">${inlineClear}</div>
         <div id="log-entries"></div>
     `;
-    document.getElementById('content').appendChild(page);
+    (mount || document.getElementById('content')).appendChild(page);
 
     const filtersDiv = page.querySelector('#log-filters');
     const logEntries = page.querySelector('#log-entries');
-    const logsNavBtn = document.querySelector('.nav-btn[data-page="logs"]');
+    function isLogsVisible() {
+        return embedded
+            ? state.activePage === hostPage && (hostPage === 'dashboard' ? state.dashboardActiveSubtab : state.settingsActiveSubtab) === hostSubtab
+            : state.activePage === 'logs';
+    }
 
     function scrollToLatest() {
-        if (state.activePage !== 'logs') return;
+        if (!isLogsVisible()) return;
         requestAnimationFrame(() => {
             logEntries.scrollTop = logEntries.scrollHeight;
         });
@@ -52,6 +67,10 @@ export function initLogs({ ws, state }) {
     }
 
     function renderFilters() {
+        // v5.7.0: when embedded, the Clear button lives inside .logs-filters
+        // (replacing the duplicate header it used to live in). Preserve any
+        // child element flagged with .logs-inline-clear when rebuilding chips.
+        const inlineClear = filtersDiv.querySelector('.logs-inline-clear');
         filtersDiv.innerHTML = '';
         Object.entries(LOG_CATEGORIES).forEach(([key, cat]) => {
             const chip = document.createElement('button');
@@ -65,6 +84,7 @@ export function initLogs({ ws, state }) {
             });
             filtersDiv.appendChild(chip);
         });
+        if (inlineClear) filtersDiv.appendChild(inlineClear);
     }
 
     function trimEntries() {
@@ -304,7 +324,10 @@ export function initLogs({ ws, state }) {
         logEntries.innerHTML = '';
     });
 
-    logsNavBtn?.addEventListener('click', () => {
-        scrollToLatest();
+    window.addEventListener('ouro:settings-subtab-shown', (event) => {
+        if (event.detail?.tab === 'logs') scrollToLatest();
+    });
+    window.addEventListener('ouro:dashboard-subtab-shown', (event) => {
+        if (event.detail?.tab === 'logs') scrollToLatest();
     });
 }

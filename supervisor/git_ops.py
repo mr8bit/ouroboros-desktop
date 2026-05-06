@@ -35,6 +35,8 @@ BRANCH_DEV: str = "ouroboros"
 BRANCH_STABLE: str = "ouroboros-stable"
 MANAGED_REPO_META_NAME = "ouroboros-managed.json"
 BOOTSTRAP_PIN_MARKER_NAME = "ouroboros-bootstrap-pending"
+UPDATE_INTENT_MARKER_NAME = "ouroboros-update-intent.json"
+OFFICIAL_UPDATE_REMOTE_URL = "https://github.com/joi-lab/ouroboros-desktop"
 
 
 def init(repo_dir: pathlib.Path, drive_root: pathlib.Path, remote_url: str,
@@ -57,6 +59,10 @@ def _managed_repo_meta_path() -> pathlib.Path:
 
 def _bootstrap_pin_marker_path() -> pathlib.Path:
     return _git_dir() / BOOTSTRAP_PIN_MARKER_NAME
+
+
+def _update_intent_marker_path() -> pathlib.Path:
+    return _git_dir() / UPDATE_INTENT_MARKER_NAME
 
 
 def _read_managed_repo_meta() -> Dict[str, Any]:
@@ -142,6 +148,32 @@ def _clear_bootstrap_pin_marker() -> None:
         return
     except Exception:
         log.warning("Failed to clear bootstrap pin marker", exc_info=True)
+
+
+def _read_update_intent() -> Dict[str, Any]:
+    path = _update_intent_marker_path()
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_update_intent(payload: Dict[str, Any]) -> None:
+    path = _update_intent_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _clear_update_intent() -> None:
+    try:
+        _update_intent_marker_path().unlink()
+    except FileNotFoundError:
+        return
+    except Exception:
+        log.warning("Failed to clear update intent marker", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +548,64 @@ def _rescue_untracked_incomplete(rescue_info: Dict[str, Any]) -> str:
     return ""
 
 
+def _compute_ref_ahead_count(ref: str, target_ref: str) -> Tuple[bool, int, str]:
+    """Return whether *ref* is ahead of *target_ref*, failing closed on errors."""
+    if not ref or not target_ref:
+        return False, 0, "missing ref for ahead comparison"
+    rc, counts, err = git_capture([
+        "git", "rev-list", "--left-right", "--count", f"{ref}...{target_ref}",
+    ])
+    if rc != 0:
+        return False, 0, err or f"git rev-list failed for {ref}...{target_ref}"
+    try:
+        ahead, _behind = (int(part) for part in counts.split())
+    except Exception:
+        return False, 0, f"could not parse ahead/behind counts: {counts!r}"
+    return True, ahead, ""
+
+
+def _ref_points_at_ref(left_ref: str, right_ref: str) -> bool:
+    left_ref = str(left_ref or "").strip()
+    right_ref = str(right_ref or "").strip()
+    if not left_ref or not right_ref:
+        return False
+    rc_left, left_sha, _ = git_capture(["git", "rev-parse", "--verify", left_ref])
+    if rc_left != 0 or not left_sha:
+        return False
+    rc_right, right_sha, _ = git_capture(["git", "rev-parse", "--verify", right_ref])
+    return rc_right == 0 and bool(right_sha) and left_sha.strip() == right_sha.strip()
+
+
+def preserve_local_ref_branch(ref: str = "HEAD", prefix: str = "local-keep") -> Tuple[bool, str]:
+    """Create a local branch pointing at *ref* before replacing it."""
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    branch_name = f"{prefix}-{now}-{uuid.uuid4().hex[:6]}"
+    rc, _out, err = git_capture(["git", "branch", branch_name, ref])
+    if rc != 0:
+        return False, err or f"failed to create {branch_name}"
+    return True, branch_name
+
+
+def _preserve_branch_for_official_reset(
+    branch: str,
+    target_ref: str,
+    update_intent: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """Ensure local commits survive an explicit official update reset."""
+    count_ok, ahead, count_error = _compute_ref_ahead_count(branch, target_ref)
+    if not count_ok:
+        return False, f"Could not compare {branch} with update target {target_ref}: {count_error}"
+    if ahead <= 0:
+        return True, ""
+    existing = str(update_intent.get("keep_branch") or "").strip()
+    if existing and _ref_points_at_ref(existing, branch):
+        return True, existing
+    ok, branch_or_error = preserve_local_ref_branch(branch)
+    if not ok:
+        return False, branch_or_error
+    return True, branch_or_error
+
+
 # ---------------------------------------------------------------------------
 # Checkout + reset
 # ---------------------------------------------------------------------------
@@ -526,13 +616,21 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
     fetch_remote = ""
     target_ref = ""
     pin_bundle_sha = _pin_to_bundle_sha_on_bootstrap(reason, managed_meta)
-    if managed_meta and not pin_bundle_sha:
-        remote_name = _managed_remote_name(managed_meta)
-        remote_branch = _managed_remote_branch_for(branch, managed_meta)
-        if remote_branch and _has_remote(remote_name):
-            fetch_remote = remote_name
-            target_ref = f"{remote_name}/{remote_branch}"
-    elif not pin_bundle_sha and _has_remote("origin"):
+    update_intent = _read_update_intent()
+    update_intent_target = ""
+    intent_keep_branch = ""
+    if managed_meta and not pin_bundle_sha and update_intent:
+        intent_branch = str(update_intent.get("branch") or BRANCH_DEV)
+        intent_sha = str(update_intent.get("target_sha") or "").strip()
+        if intent_branch == branch and intent_sha:
+            rc_intent, _sha_out, _sha_err = git_capture(["git", "rev-parse", "--verify", intent_sha])
+            if rc_intent == 0:
+                update_intent_target = intent_sha
+                target_ref = intent_sha
+                intent_keep_branch = str(update_intent.get("keep_branch") or "").strip()
+            else:
+                log.warning("Ignoring update intent with missing target sha %s", intent_sha)
+    if not managed_meta and not pin_bundle_sha and _has_remote("origin"):
         fetch_remote = "origin"
 
     if fetch_remote:
@@ -559,9 +657,10 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         repo_state = _collect_repo_sync_state()
         dirty_lines = list(repo_state.get("dirty_lines") or [])
         unpushed_lines = list(repo_state.get("unpushed_lines") or [])
-        if dirty_lines or unpushed_lines:
+        unpushed_needs_rescue = bool(update_intent_target and unpushed_lines)
+        if dirty_lines or unpushed_needs_rescue:
             bits: List[str] = []
-            if unpushed_lines:
+            if unpushed_lines and (dirty_lines or unpushed_needs_rescue):
                 bits.append(f"unpushed={len(unpushed_lines)}")
             if dirty_lines:
                 bits.append(f"dirty={len(dirty_lines)}")
@@ -717,7 +816,29 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         ).returncode == 0
 
     if remote_ref_exists:
+        if update_intent_target:
+            preserve_ok, preserve_msg = _preserve_branch_for_official_reset(
+                branch, target_ref, update_intent,
+            )
+            if not preserve_ok:
+                return False, f"Could not preserve local branch before official update: {preserve_msg}"
+            if preserve_msg and preserve_msg != intent_keep_branch:
+                append_jsonl(
+                    DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "type": "ui_update_preserved_late_head",
+                        "target_branch": branch,
+                        "reason": reason,
+                        "target_ref": target_ref,
+                        "keep_branch": preserve_msg,
+                    },
+                )
+            _run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(REPO_DIR), check=True)
+            _run_git_resilient(["git", "clean", "-fd"], cwd=str(REPO_DIR), check=True)
         _run_git_resilient(["git", "checkout", "-B", branch, target_ref], cwd=str(REPO_DIR), check=True)
+        if update_intent_target:
+            _run_git_resilient(["git", "reset", "--hard", target_ref], cwd=str(REPO_DIR), check=True)
         _run_git_resilient(["git", "clean", "-fd"], cwd=str(REPO_DIR), check=True)
     else:
         rc_local = subprocess.run(
@@ -730,8 +851,13 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
             _run_git_resilient(["git", "clean", "-fd"], cwd=str(REPO_DIR), check=True)
             _run_git_resilient(["git", "checkout", "-b", branch], cwd=str(REPO_DIR), check=False)
         else:
+            if policy == "rescue_and_reset":
+                _run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(REPO_DIR), check=True)
+                _run_git_resilient(["git", "clean", "-fd"], cwd=str(REPO_DIR), check=True)
             _run_git_resilient(["git", "checkout", branch], cwd=str(REPO_DIR), check=True)
             _run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(REPO_DIR), check=True)
+            if policy == "rescue_and_reset":
+                _run_git_resilient(["git", "clean", "-fd"], cwd=str(REPO_DIR), check=True)
 
     # Clean __pycache__ to prevent stale bytecode (git checkout may not update mtime)
     for p in REPO_DIR.rglob("__pycache__"):
@@ -743,8 +869,12 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     save_state(st)
+    if update_intent_target and st["current_sha"] != update_intent_target:
+        return False, f"Update intent checkout landed on {st['current_sha']} but expected {update_intent_target}"
     if pin_bundle_sha:
         _clear_bootstrap_pin_marker()
+    if update_intent_target and str(reason or "") != "ui_update_apply":
+        _clear_update_intent()
     return True, "ok"
 
 
@@ -912,6 +1042,224 @@ def list_commits(max_count: int = 30) -> List[Dict[str, Any]]:
                 "date": parts[2], "message": parts[3],
             })
     return commits
+
+
+def _managed_update_target(branch: Optional[str] = None) -> Tuple[str, str, str]:
+    """Return (remote_name, remote_branch, target_ref) for launcher-managed updates."""
+    target_branch = branch or BRANCH_DEV
+    managed_meta = _read_managed_repo_meta()
+    if not managed_meta:
+        return "", "", ""
+    remote_name = "managed"
+    remote_branch = _managed_remote_branch_for(target_branch, managed_meta)
+    target_ref = f"{remote_name}/{remote_branch}" if remote_name and remote_branch else ""
+    return remote_name, remote_branch, target_ref
+
+
+def ensure_official_update_remote() -> Tuple[bool, str]:
+    """Ensure the managed update remote points at the official Ouroboros repository."""
+    remotes = _list_remotes()
+    if "managed" in remotes:
+        rc, _out, err = git_capture(["git", "remote", "set-url", "managed", OFFICIAL_UPDATE_REMOTE_URL])
+    else:
+        rc, _out, err = git_capture(["git", "remote", "add", "managed", OFFICIAL_UPDATE_REMOTE_URL])
+    return rc == 0, err
+
+
+def list_official_update_tags(max_count: int = 30) -> List[Dict[str, Any]]:
+    """Return official tags from the official managed remote, separate from local/user tags."""
+    if not _has_remote("managed"):
+        return []
+    rc, raw, _err = git_capture([
+        "git", "ls-remote", "--tags", "--refs", "--sort=-version:refname",
+        "managed", "refs/tags/v*",
+    ])
+    if rc != 0:
+        return []
+    tags: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        tags.append({
+            "tag": parts[1].rsplit("/", 1)[-1],
+            "sha": parts[0],
+            "source": "official",
+        })
+        if len(tags) >= max_count:
+            break
+    return tags
+
+
+def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
+    """Return current managed-remote divergence for the UI Update panel."""
+    branch_dev, _branch_stable = managed_branch_defaults()
+    remote_name, remote_branch, target_ref = _managed_update_target(branch_dev)
+    official_remote_ok = True
+    official_remote_err = ""
+    if fetch and remote_name:
+        official_remote_ok, official_remote_err = ensure_official_update_remote()
+    state: Dict[str, Any] = {
+        "managed": bool(_read_managed_repo_meta()),
+        "remote": remote_name,
+        "remote_branch": remote_branch,
+        "target_ref": target_ref,
+        "current_branch": "unknown",
+        "current_sha": "",
+        "current_short_sha": "",
+        "latest_sha": "",
+        "latest_short_sha": "",
+        "latest_message": "",
+        "ahead": 0,
+        "behind": 0,
+        "dirty": False,
+        "dirty_count": 0,
+        "dirty_preview": [],
+        "warnings": [],
+        "available": False,
+        "safe_to_apply": False,
+    }
+    if not official_remote_ok:
+        state["warnings"].append(f"remote_config_error:{official_remote_err or 'unknown error'}")
+        state["managed"] = False
+        state["available"] = False
+        state["safe_to_apply"] = False
+        return state
+
+    rc, branch, err = git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    if rc == 0:
+        state["current_branch"] = branch
+    elif err:
+        state["warnings"].append(f"branch_error:{err}")
+
+    rc, sha, err = git_capture(["git", "rev-parse", "HEAD"])
+    if rc == 0:
+        state["current_sha"] = sha
+        state["current_short_sha"] = sha[:8]
+    elif err:
+        state["warnings"].append(f"head_error:{err}")
+
+    rc, dirty, err = git_capture(["git", "status", "--porcelain"])
+    if rc == 0:
+        dirty_lines = [line for line in dirty.splitlines() if line.strip()]
+        state["dirty"] = bool(dirty_lines)
+        state["dirty_count"] = len(dirty_lines)
+        state["dirty_preview"] = dirty_lines[:20]
+    elif err:
+        state["warnings"].append(f"status_error:{err}")
+
+    if fetch and remote_name:
+        rc, _out, err = git_capture(["git", "fetch", remote_name])
+        if rc != 0:
+            state["warnings"].append(f"fetch_error:{err or 'unknown error'}")
+
+    if not target_ref:
+        state["warnings"].append("managed_updates_unavailable")
+        return state
+    if not fetch:
+        state["warnings"].append("official_status_requires_check")
+        return state
+    if not _has_remote(remote_name):
+        state["warnings"].append(f"missing_remote:{remote_name}")
+        return state
+
+    rc, latest_sha, err = git_capture(["git", "rev-parse", "--verify", target_ref])
+    if rc != 0:
+        state["warnings"].append(f"target_ref_error:{err or target_ref}")
+        return state
+    state["latest_sha"] = latest_sha
+    state["latest_short_sha"] = latest_sha[:8]
+
+    rc, latest_msg, _err = git_capture(["git", "log", "-1", "--format=%s", target_ref])
+    if rc == 0:
+        state["latest_message"] = latest_msg
+
+    rc, counts, err = git_capture(["git", "rev-list", "--left-right", "--count", f"HEAD...{target_ref}"])
+    if rc == 0:
+        try:
+            ahead, behind = (int(part) for part in counts.split())
+        except Exception:
+            ahead, behind = 0, 0
+            state["warnings"].append(f"divergence_parse_error:{counts}")
+        state["ahead"] = ahead
+        state["behind"] = behind
+        state["available"] = behind > 0
+        state["safe_to_apply"] = behind > 0 and ahead == 0 and not state["dirty"]
+    elif err:
+        state["warnings"].append(f"divergence_error:{err}")
+    return state
+
+
+def preserve_local_head_branch(prefix: str = "local-keep") -> Tuple[bool, str]:
+    """Create a local branch pointing at current HEAD before replacing it."""
+    return preserve_local_ref_branch("HEAD", prefix=prefix)
+
+
+def prepare_managed_update(strategy: str = "replace") -> Tuple[bool, Dict[str, Any]]:
+    """Prepare a user-requested managed update before the process restarts."""
+    status = compute_managed_update_status(fetch=True)
+    if not status.get("managed"):
+        return False, {"error": "Managed updates are unavailable for this checkout.", "status": status}
+    if not status.get("available"):
+        return False, {"error": "No managed update is available.", "status": status}
+
+    strategy = str(strategy or "replace").strip().lower()
+    if strategy not in {"replace", "stash", "force"}:
+        strategy = "replace"
+
+    repo_state = _collect_repo_sync_state()
+    rescue_info: Dict[str, Any] = {}
+    try:
+        rescue_info = _create_rescue_snapshot(
+            branch=str(repo_state.get("current_branch") or BRANCH_DEV),
+            reason=f"ui_update_{strategy}",
+            repo_state=repo_state,
+        )
+    except Exception as exc:
+        return False, {"error": f"Rescue snapshot failed: {exc!r}", "status": status}
+    if rescue_info.get("diff_error"):
+        return False, {"error": f"Rescue diff capture failed: {rescue_info.get('diff_error')}", "status": status}
+    incomplete = _rescue_untracked_incomplete(rescue_info)
+    if incomplete:
+        return False, {"error": f"Untracked-file rescue incomplete: {incomplete}", "status": status}
+
+    target_sha = str(status.get("latest_sha") or "").strip()
+    if not target_sha:
+        return False, {"error": "Managed update target SHA is missing.", "status": status}
+    keep_branch = ""
+    count_ok, ahead, count_error = _compute_ref_ahead_count(BRANCH_DEV, target_sha)
+    if not count_ok:
+        return False, {
+            "error": f"Could not compare local branch with managed update target: {count_error}",
+            "status": status,
+        }
+    if ahead > 0:
+        ok, keep_branch_or_error = preserve_local_ref_branch(BRANCH_DEV)
+        if not ok:
+            return False, {"error": f"Could not preserve local branch: {keep_branch_or_error}", "status": status}
+        keep_branch = keep_branch_or_error
+    _write_update_intent({
+        "schema_version": 1,
+        "branch": BRANCH_DEV,
+        "target_sha": target_sha,
+        "target_ref": status.get("target_ref") or "",
+        "strategy": strategy,
+        "keep_branch": keep_branch,
+        "requested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    })
+
+    append_jsonl(
+        DRIVE_ROOT / "logs" / "supervisor.jsonl",
+        {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "type": "ui_update_requested",
+            "strategy": strategy,
+            "status": status,
+            "rescue": rescue_info,
+            "keep_branch": keep_branch,
+        },
+    )
+    return True, {"status": status, "rescue": rescue_info, "keep_branch": keep_branch}
 
 
 def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tuple[bool, str]:

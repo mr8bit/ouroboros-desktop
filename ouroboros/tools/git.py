@@ -12,6 +12,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -92,12 +93,12 @@ def _fingerprint_staged_diff(repo_dir: pathlib.Path) -> Dict[str, Any]:
     }
 
 
-def _staged_paths_for_protection(repo_dir: pathlib.Path) -> list[str]:
+def _staged_paths_for_protection(repo_dir: pathlib.Path) -> Optional[list[str]]:
     """Return staged paths including both sides of renames/copies."""
     try:
         raw = run_cmd(["git", "diff", "--cached", "--name-status", "-M"], cwd=repo_dir)
     except Exception:
-        return []
+        return None
     paths: list[str] = []
     for line in raw.splitlines():
         if not line.strip():
@@ -109,6 +110,8 @@ def _staged_paths_for_protection(repo_dir: pathlib.Path) -> list[str]:
             paths.extend([parts[1], parts[2]])
         elif len(parts) >= 2:
             paths.append(parts[-1])
+        elif parts:
+            paths.append(parts[0])
     return paths
 
 
@@ -177,6 +180,67 @@ def _finalize_blocked_review(
     return combined_msg
 
 
+_DOC_ONLY_EXTENSIONS = (".md", ".txt", ".rst")
+
+
+def _diff_is_doc_only(staged_paths: List[str]) -> bool:
+    """Return True iff every staged path is a documentation file outside ``tests/``.
+
+    Prose docs (.md/.txt/.rst) changes can't break test behaviour, so the
+    preflight test gate is wasteful for them. The maintainer hit a 6-retry
+    loop on a doc-only commit (39 rounds, 3 hours) before this check existed.
+    JSON is intentionally excluded: config/schema/package JSON can affect
+    runtime behaviour and must keep the preflight.
+    Defensive: any staged file under ``tests/`` triggers the full preflight,
+    even if the extension is .md, since test fixtures can be markdown.
+    """
+    if not staged_paths:
+        return False
+    saw_any = False
+    for raw in staged_paths:
+        p = str(raw).strip()
+        if not p:
+            continue
+        saw_any = True
+        if p.startswith("tests/") or "/tests/" in p:
+            return False
+        if not p.lower().endswith(_DOC_ONLY_EXTENSIONS):
+            return False
+    return saw_any
+
+
+def _mark_failed_bypass_advisory_stale(
+    ctx: ToolContext,
+    commit_message: str,
+    advisory_paths: Optional[List[str]],
+) -> None:
+    """Prevent a failed bypass preflight from satisfying later freshness checks."""
+    try:
+        from ouroboros.review_state import (
+            compute_snapshot_hash,
+            make_repo_key,
+            update_state,
+            _utc_now,
+        )
+
+        snapshot_hash = compute_snapshot_hash(
+            pathlib.Path(ctx.repo_dir),
+            commit_message,
+            paths=advisory_paths,
+        )
+        repo_key = make_repo_key(pathlib.Path(ctx.repo_dir))
+
+        def _mutate(state):
+            state.mark_stale(snapshot_hash)
+            state.last_stale_from_edit_ts = _utc_now()
+            state.last_stale_reason = "tests_preflight_blocked"
+            state.last_stale_repo_key = repo_key
+
+        update_state(pathlib.Path(ctx.drive_root), _mutate)
+    except Exception:
+        log.debug("Failed to stale bypass advisory after preflight block", exc_info=True)
+
+
 def _run_reviewed_stage_cycle(
     ctx: ToolContext,
     commit_message: str,
@@ -184,6 +248,7 @@ def _run_reviewed_stage_cycle(
     *,
     paths: Optional[List[str]] = None,
     skip_advisory_pre_review: bool = False,
+    skip_tests: bool = False,
     goal: str = "",
     scope: str = "",
     review_rebuttal: str = "",
@@ -240,7 +305,10 @@ def _run_reviewed_stage_cycle(
     advisory_paths = [
         line.strip() for line in staged_names_raw.splitlines() if line.strip()
     ] or None
-    protected_staged_paths = protected_paths_in(_staged_paths_for_protection(pathlib.Path(ctx.repo_dir)))
+    classification_paths = _staged_paths_for_protection(pathlib.Path(ctx.repo_dir))
+    if classification_paths is None:
+        classification_paths = advisory_paths or []
+    protected_staged_paths = protected_paths_in(classification_paths)
     runtime_mode = _current_runtime_mode()
     if protected_staged_paths and not mode_allows_protected_write(runtime_mode):
         msg = _protected_paths_block_message(
@@ -295,8 +363,21 @@ def _run_reviewed_stage_cycle(
     # this gate, broken code could reach the expensive triad + scope review.
     # Mirror the same pytest preflight here so both bypass paths provide
     # equivalent coverage.
+    #
+    # Two skip paths layered on top:
+    #   1. ``skip_tests=True`` — explicit caller opt-out. Previously this flag
+    #      was silently ignored when advisory was bypassed (the agent surfaced
+    #      this bug at 16:25:32 after a 39-round commit-loop task).
+    #   2. Doc-only diffs — prose `.md`/`.txt`/`.rst` changes outside
+    #      ``tests/`` can't affect test behaviour, so running the full
+    #      pytest suite is pure overhead. JSON/config files are excluded.
+    #      Disable via
+    #      ``OUROBOROS_PREFLIGHT_DIFF_AWARE=false`` if the heuristic ever
+    #      misfires.
     _advisory_bypassed = skip_advisory_pre_review or not os.environ.get("ANTHROPIC_API_KEY", "")
-    if _advisory_bypassed:
+    _diff_aware = (os.environ.get("OUROBOROS_PREFLIGHT_DIFF_AWARE", "true") or "true").strip().lower() in ("true", "1", "yes")
+    _doc_only = _diff_aware and _diff_is_doc_only(classification_paths)
+    if _advisory_bypassed and not skip_tests and not _doc_only:
         try:
             ctx.emit_progress_fn(
                 "Advisory bypassed — running test preflight before triad + scope review..."
@@ -325,11 +406,28 @@ def _run_reviewed_stage_cycle(
                 block_details=msg,
                 duration_sec=time.time() - commit_start,
             )
+            _mark_failed_bypass_advisory_stale(ctx, commit_message, advisory_paths)
             return {
                 "status": "blocked",
                 "message": msg,
                 "block_reason": "tests_preflight_blocked",
             }
+    elif _advisory_bypassed:
+        # Skip path: emit a visible progress note so the operator (and the
+        # events log) records why preflight didn't run. ``reason`` is the most
+        # specific applicable cause.
+        if skip_tests and _doc_only:
+            _skip_reason = "skip_tests + doc_only"
+        elif skip_tests:
+            _skip_reason = "skip_tests"
+        else:
+            _skip_reason = "doc_only"
+        try:
+            ctx.emit_progress_fn(
+                f"Advisory bypassed — preflight tests skipped ({_skip_reason})."
+            )
+        except Exception:
+            pass
 
     pre_fingerprint = _fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
     if not pre_fingerprint.get("ok"):
@@ -652,9 +750,10 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
     tests_dir = pathlib.Path(ctx.repo_dir) / "tests"
     if not tests_dir.exists():
         return None
+    agent_python = sys.executable or os.environ.get("OUROBOROS_AGENT_PYTHON") or "python3"
     try:
         result = subprocess.run(
-            ["pytest", "tests/", "-q", "--tb=line", "--no-header"],
+            [agent_python, "-m", "pytest", "tests/", "-q", "--tb=line", "--no-header"],
             cwd=ctx.repo_dir, capture_output=True, text=True, timeout=180,
         )
         if result.returncode == 0:
@@ -666,7 +765,7 @@ def _run_pre_push_tests(ctx: ToolContext) -> Optional[str]:
     except subprocess.TimeoutExpired:
         return "⚠️ PRE_PUSH_TEST_ERROR: pytest timed out after 180 seconds"
     except FileNotFoundError:
-        return "⚠️ PRE_PUSH_TEST_ERROR: pytest not installed or not found in PATH"
+        return f"⚠️ PRE_PUSH_TEST_ERROR: pytest not available via interpreter: {agent_python}"
     except Exception as e:
         log.warning(f"Pre-push tests failed with exception: {e}", exc_info=True)
         return f"⚠️ PRE_PUSH_TEST_ERROR: Unexpected error running tests: {e}"
@@ -1101,6 +1200,7 @@ def _repo_write_commit(ctx: ToolContext, path: str, content: str,
             commit_message,
             _commit_start,
             paths=stage_paths,
+            skip_tests=skip_tests,
         )
         if outcome.get("status") != "passed":
             message = str(outcome.get("message", "") or "")
@@ -1202,13 +1302,52 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         try:
             run_cmd(["git", "checkout", ctx.branch_dev], cwd=ctx.repo_dir)
         except Exception as e:
-            return _fail(f"⚠️ GIT_ERROR (checkout): {_sanitize_git_error(str(e))}")
+            # The original code aborted on ANY checkout failure — including
+            # the common case where the agent is already on ``branch_dev``
+            # with a dirty tree because the dirty files ARE what they're
+            # trying to commit. When checkout fails, check whether we're
+            # already on the right branch. If so, the checkout failure is
+            # incidental (typically a no-op-but-git-complained on a dirty
+            # tree) and we can proceed to staging. Only abort when on a
+            # different branch — where the checkout was actually needed.
+            err_msg = _sanitize_git_error(str(e))
+            already_on_target = False
+            try:
+                current_branch = run_cmd(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=ctx.repo_dir,
+                ).strip()
+                already_on_target = (current_branch == ctx.branch_dev)
+            except Exception:
+                pass
+            if not already_on_target:
+                return _fail(f"⚠️ GIT_ERROR (checkout): {err_msg}")
+            try:
+                unmerged = run_cmd(
+                    ["git", "diff", "--name-only", "--diff-filter=U"],
+                    cwd=ctx.repo_dir,
+                ).strip()
+            except Exception as status_err:
+                return _fail(
+                    "⚠️ GIT_ERROR (checkout): "
+                    f"{err_msg}\n\nCould not verify index state after checkout failure: "
+                    f"{_sanitize_git_error(str(status_err))}"
+                )
+            if unmerged:
+                return _fail(
+                    "⚠️ GIT_ERROR (checkout): "
+                    f"{err_msg}\n\nRepository has unmerged paths; refusing to treat "
+                    "the checkout failure as an incidental dirty-tree no-op.\n"
+                    f"{unmerged}"
+                )
+            # else: already on branch_dev with a clean merge index; proceed to stage.
         outcome = _run_reviewed_stage_cycle(
             ctx,
             commit_message,
             _commit_start,
             paths=paths,
             skip_advisory_pre_review=skip_advisory_pre_review,
+            skip_tests=skip_tests,
             goal=goal,
             scope=scope,
             review_rebuttal=review_rebuttal,

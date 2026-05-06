@@ -56,7 +56,7 @@ def test_live_card_recovery_keeps_step_failures_non_terminal():
     chat_source = _read("web/modules/chat.js")
     log_source = _read("web/modules/log_events.js")
 
-    assert "return phase === 'done';" in chat_source
+    assert "return phase === 'done' || phase === 'lifecycle_error';" in chat_source
     assert "if (phase === 'warn') return 'Notice';" in chat_source
     assert "record.finished = isTerminalTaskPhase(nextPhase);" in chat_source
     assert "const activePhase = ['error', 'timeout'].includes(phase) ? phase : 'done';" in chat_source
@@ -290,12 +290,14 @@ def test_chat_input_has_glassmorphism():
     start = css.index("#chat-input {")
     end = css.index("#chat-input:focus")
     chat_input_block = css[start:end]
-    # Must have high-quality backdrop blur on the textarea itself
-    assert "backdrop-filter: blur(16px)" in chat_input_block
-    # Background should be semi-transparent (frosted glass, opacity 0.62)
-    assert "rgba(26, 21, 32, 0.62)" in chat_input_block
+    # Must have high-quality backdrop blur on the textarea itself. v5.7.0
+    # moved the blur focus to the input field (20px) and left the wrapper as
+    # a no-blur soft darkening gradient.
+    assert "backdrop-filter: blur(20px)" in chat_input_block
+    # Background should be semi-transparent (frosted glass, opacity 0.55)
+    assert "rgba(26, 21, 32, 0.55)" in chat_input_block
     # Border should be a white tint (design system for frosted glass surfaces)
-    assert "rgba(255, 255, 255, 0.09)" in chat_input_block
+    assert "rgba(255, 255, 255, 0.10)" in chat_input_block
     # Must not use opaque background
     assert "var(--bg-secondary)" not in chat_input_block
 
@@ -315,15 +317,19 @@ def test_log_phases_use_crimson_not_blue():
 
 
 def test_about_uses_css_classes_not_inline():
-    """about.js must use CSS classes, not inline style= attributes."""
-    src = _read("web/modules/about.js")
+    """About sub-tab inside Settings (v5.7.0+) must use CSS classes, not
+    inline style= attributes. About used to be a top-level page rendered
+    by web/modules/about.js; in v5.7.0 the content moved into Settings as
+    a sub-tab section. We assert the markup against settings_ui.js where
+    the new About panel lives."""
+    src = _read("web/modules/settings_ui.js")
     assert 'class="about-body"' in src
     assert 'class="about-logo"' in src
     assert 'class="about-title"' in src
     assert 'class="about-credits"' in src
     assert 'class="about-footer"' in src
-    # No inline style= should remain
-    assert 'style="' not in src
+    # The About <section> declaration is the marker the panel exists
+    assert 'data-settings-panel="about"' in src
 
 
 def test_costs_uses_css_classes_not_inline():
@@ -344,7 +350,7 @@ def test_costs_uses_css_classes_not_inline():
 
 
 def test_costs_about_css_classes_defined():
-    """All CSS classes used by about.js and costs.js must be defined in style.css."""
+    """All CSS classes used by the About sub-tab and costs.js must be defined in style.css."""
     css = _read("web/style.css")
     for cls in [".about-body", ".about-logo", ".about-title", ".about-footer",
                 ".costs-stats-grid", ".costs-tables-grid", ".costs-table-label",
@@ -611,6 +617,16 @@ def test_sync_history_two_pass_progress_before_finalize():
 
     assert "if (taskState.completed) continue;" not in pass1_body, \
         "Pass 1 must not skip progress messages due to taskState.completed"
+
+
+def test_skill_lifecycle_terminal_progress_can_finish_live_card():
+    source = _read("web/modules/log_events.js")
+    chat_source = _read("web/modules/chat.js")
+
+    assert "startsWith('skill_lifecycle_')" in source
+    assert "completed|failed" in source
+    assert "lifecycleTerminal" in source
+    assert "phase === 'done' || phase === 'lifecycle_error'" in chat_source
 
 
 def test_sync_history_shows_typing_for_ongoing_tasks():
@@ -1108,10 +1124,18 @@ def test_clipboard_paste_handler_exists():
     )
 
 
-# ─── Bottom-fade gradient layer is separate from #chat-input-area ───────
+# ─── Chat input dock gradient contract ─────────────────────────────────
 
-def test_chat_bottom_fade_is_removed_and_padding_is_dynamic():
-    """Bottom fade is removed; input overlap is handled by JS padding."""
+def test_chat_input_dock_has_glass_gradient_without_absolute_positioning():
+    """Absolute composer uses a compact soft fade on the wrapper; blur lives on the input.
+
+    v5.7.0 restored the scroll-under composer overlay, but the visual rule is
+    now deliberately split:
+
+    - #chat-input-area: compact single-element darkening gradient, no wrapper blur.
+    - #chat-input: frosted-glass blur (20px) + semi-transparent fill.
+    - no separate .chat-bottom-fade layer.
+    """
     css = _read("web/style.css")
     input_area_match = re.search(
         r"#chat-input-area\s*\{([^}]*)\}",
@@ -1119,12 +1143,126 @@ def test_chat_bottom_fade_is_removed_and_padding_is_dynamic():
     )
     assert input_area_match, "#chat-input-area rule must be parseable"
     input_area_body = input_area_match.group(1)
-    # We tolerate other `background:` properties (none expected today) but
-    # specifically forbid linear-gradient bleeding through the input dock.
-    assert "linear-gradient" not in input_area_body, (
-        "#chat-input-area must not paint a bottom-fade gradient."
-    )
+    assert "linear-gradient" in input_area_body
+    assert "backdrop-filter" not in input_area_body
+    assert "position: absolute" in input_area_body
+    assert "padding: 32px 16px 16px" in input_area_body
     chat_js = _read("web/modules/chat.js")
     assert 'class="chat-bottom-fade"' not in chat_js
-    assert "ResizeObserver" in chat_js
     assert "scrollToBottomAfterLayout" in chat_js
+    assert "messagesDiv.style.paddingBottom" not in chat_js
+    assert "--chat-input-reserve" in css
+    assert "messagesDiv.style.setProperty('--chat-input-reserve'" in chat_js
+
+
+def test_mobile_chat_uses_flex_composer_layout_and_no_interactive_widget():
+    css = _read("web/style.css")
+    html = _read("web/index.html")
+
+    assert "interactive-widget" not in html
+    input_area = re.search(r"#chat-input-area\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
+    chat_messages = re.search(r"#chat-messages\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
+    assert "position: absolute" in input_area
+    assert "bottom: 0" in input_area
+    assert "min-height: 0" in chat_messages
+
+
+def test_budget_pill_navigates_to_settings_costs():
+    source = _read("web/modules/chat.js")
+    css = _read("web/style.css")
+
+    assert 'id="chat-budget-pill" type="button"' in source
+    assert "openDashboardTab('costs')" in source
+    budget_block = re.search(r"\.chat-budget-pill\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
+    assert "cursor: pointer" in budget_block
+
+
+def test_desktop_vvh_uses_dvh_unit_not_px_snapshot():
+    js = _read("web/app.js")
+    css = _read("web/style.css")
+
+    assert "vvhStyle.textContent = ':root{--vvh:100dvh}';" in js
+    assert "const safeHeight = Math.max(320, Math.ceil(h || window.innerHeight || 0));" in js
+    assert "vvhStyle.textContent = ':root{--vvh:' + safeHeight + 'px}';" in js
+    assert "vvhStyle.textContent = ':root{--vvh:' + h + 'px}';" not in js
+
+    wide_viewport_block = re.search(
+        r"\}\s+else\s+\{(?P<body>.*?)vvhStyle\.textContent = ':root\{--vvh:100dvh\}';",
+        js,
+        re.S,
+    ).group("body")
+    assert "document.documentElement.classList.remove('keyboard-open');" in wide_viewport_block
+    assert "document.body.classList.remove('keyboard-open');" in wide_viewport_block
+
+    root_block = re.search(r":root\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
+    body_block = re.search(r"body\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
+    app_block = re.search(r"#app\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
+    assert "--vvh: 100dvh" in root_block
+    assert "height: var(--vvh)" in body_block
+    assert "height: var(--vvh)" in app_block
+
+
+def test_mobile_keyboard_open_uses_visual_viewport_flex_stack():
+    """Static contract test: keyboard-open JS toggle + CSS layout rules exist."""
+    js = _read("web/app.js")
+    css = _read("web/style.css")
+
+    assert "keyboard-open" in js
+    assert "visualViewport" in js
+    assert "frozenBaseline" in js
+    assert "documentElement.clientHeight" in js
+    assert "touchmove" in js
+    assert "lockBoundaryTouch" in js
+    assert "findScrollableKeyboardNode" in js
+    assert "el.id === 'chat-input'" in js
+    assert "classList?.contains('chat-live-timeline')" in js
+    wide_viewport_cleanup = re.search(
+        r"\}\s+else\s+\{(?P<body>.*?)document\.documentElement\.classList\.remove\('keyboard-open'\)", js, re.S
+    ).group("body")
+    assert "if (wasKeyboardOpen)" in wide_viewport_cleanup
+    assert "document.removeEventListener('touchstart', lockTouchStart);" in wide_viewport_cleanup
+    assert "document.removeEventListener('touchmove', lockBoundaryTouch);" in wide_viewport_cleanup
+    assert "--vvh-offset" not in js
+
+    assert "html.keyboard-open" in css
+    assert "body.keyboard-open #nav-rail" in css
+    assert "body.keyboard-open #content" in css
+    assert "body.keyboard-open #page-chat.active" in css
+    assert "body.keyboard-open #page-chat.active .chat-page-header" in css
+    assert "body.keyboard-open #page-chat.active #chat-input-area" in css
+    assert "body.keyboard-open #page-chat.active #chat-messages" in css
+    assert "body.keyboard-open #page-chat {" not in css
+
+    nav_block = re.search(
+        r"body\.keyboard-open\s+#nav-rail\s*\{(?P<body>[^}]+)\}", css, re.S
+    ).group("body")
+    assert "display: none" in nav_block
+
+    page_chat_block = re.search(
+        r"body\.keyboard-open\s+#page-chat\.active\s*\{(?P<body>[^}]+)\}", css, re.S
+    ).group("body")
+    assert "position: fixed" in page_chat_block
+    assert "flex-direction: column" in page_chat_block
+    assert "top: 0" in page_chat_block
+    assert "height: var(--vvh)" in page_chat_block
+    assert "var(--vvh-offset" not in page_chat_block
+
+    header_block = re.search(
+        r"body\.keyboard-open\s+#page-chat\.active\s+\.chat-page-header\s*\{(?P<body>[^}]+)\}", css, re.S
+    ).group("body")
+    assert "flex-shrink: 0" in header_block
+    assert "position: relative" in header_block
+
+    messages_block = re.search(
+        r"body\.keyboard-open\s+#page-chat\.active\s+#chat-messages\s*\{(?P<body>[^}]+)\}", css, re.S
+    ).group("body")
+    assert "flex: 1" in messages_block
+    assert "min-height: 0" in messages_block
+    assert "overflow-y: auto" in messages_block
+    assert "overscroll-behavior: contain" in messages_block
+
+    input_block = re.search(
+        r"body\.keyboard-open\s+#page-chat\.active\s+#chat-input-area\s*\{(?P<body>[^}]+)\}", css, re.S
+    ).group("body")
+    assert "flex-shrink: 0" in input_block
+    assert "position: relative" in input_block

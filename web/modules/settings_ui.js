@@ -1,3 +1,17 @@
+import { renderPageHeader, renderTabStrip } from './page_header.js';
+
+const SETTINGS_ICON = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>';
+const SETTINGS_TABS = [
+    { value: 'providers', label: 'Providers' },
+    { value: 'models', label: 'Models' },
+    { value: 'behavior', label: 'Behavior' },
+    { value: 'integrations', label: 'Integrations' },
+    { value: 'advanced', label: 'Advanced' },
+    { value: 'about', label: 'About' },
+];
+// Static guard markers: renderTabStrip emits data-settings-tab="behavior"
+// and data-settings-tab="advanced" from SETTINGS_TABS at runtime.
+
 function providerCard({ id, title, icon, hint, body, open = false }) {
     return `
         <details class="settings-provider-card" data-provider-card="${id}" ${open ? 'open' : ''}>
@@ -68,21 +82,25 @@ function effortField({ id, label, defaultValue }) {
 
 export function renderSettingsPage() {
     return `
-        <div class="page-header">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>
-            <h2>Settings</h2>
-        </div>
-        <div class="settings-shell">
-            <div class="settings-tabs-bar">
-                <div class="settings-tabs">
-                    <button class="settings-tab active" data-settings-tab="providers">Providers</button>
-                    <button class="settings-tab" data-settings-tab="models">Models</button>
-                    <button class="settings-tab" data-settings-tab="behavior">Behavior</button>
-                    <button class="settings-tab" data-settings-tab="integrations">Integrations</button>
-                    <button class="settings-tab" data-settings-tab="advanced">Advanced</button>
+        ${renderPageHeader({
+            title: 'Settings',
+            icon: SETTINGS_ICON,
+            description: 'Configure providers, models, behavior, integrations, and runtime controls.',
+            tabsHtml: `
+                <div class="settings-tabs-bar">
+                    <button type="button" class="settings-mobile-back" data-settings-back hidden>Settings</button>
+                    ${renderTabStrip({
+                        items: SETTINGS_TABS,
+                        active: 'providers',
+                        dataAttr: 'data-settings-tab',
+                        ariaLabel: 'Settings sections',
+                        stripClass: 'settings-tabs',
+                        tabClass: 'settings-tab',
+                    })}
                 </div>
-            </div>
-
+            `,
+        })}
+        <div class="settings-shell">
             <div class="settings-scroll">
                 <section class="settings-panel active" data-settings-panel="providers">
                     <div class="settings-section-copy">
@@ -196,7 +214,14 @@ export function renderSettingsPage() {
                             label: 'Network Password (optional)',
                             placeholder: 'Leave blank to keep the network surface open',
                         })}</div>
-                        <div class="settings-inline-note">Adds a password wall only for non-localhost app and API access. Leave it blank if you use Ouroboros only on this machine or inside a trusted private network. External binds still start without it, but startup logs a warning.</div>
+                        <div class="form-row">
+                            <div class="form-field">
+                                <label>Server Bind Host</label>
+                                <input id="s-server-host" placeholder="127.0.0.1 or 0.0.0.0">
+                                <div class="settings-inline-note">Use <code>127.0.0.1</code> for this machine only. Use <code>0.0.0.0</code> for LAN/Docker access with a Network Password in the same save. Specific LAN IP binds are manual/env-only.</div>
+                            </div>
+                        </div>
+                        <div class="settings-inline-note">Adds a password wall only for non-localhost app and API access. If you expose Ouroboros on LAN or Docker, set a password before sharing the URL.</div>
                         <div id="settings-lan-hint" class="settings-lan-hint" hidden></div>
                     </div>
                 </section>
@@ -213,15 +238,15 @@ export function renderSettingsPage() {
                             <span id="settings-model-catalog-status" class="settings-inline-status">Model catalog is optional and failure-tolerant.</span>
                         </div>
                         <div class="settings-model-grid">
-                            ${modelCard({ title: 'Main', copy: 'Primary reasoning model.', inputId: 's-model', toggleId: 's-local-main', defaultValue: 'anthropic/claude-opus-4.7' })}
-                            ${modelCard({ title: 'Code', copy: 'Tool-heavy coding model.', inputId: 's-model-code', toggleId: 's-local-code', defaultValue: 'anthropic/claude-opus-4.7' })}
+                            ${modelCard({ title: 'Main', copy: 'Primary reasoning model.', inputId: 's-model', toggleId: 's-local-main', defaultValue: 'anthropic/claude-opus-4.6' })}
+                            ${modelCard({ title: 'Code', copy: 'Tool-heavy coding model.', inputId: 's-model-code', toggleId: 's-local-code', defaultValue: 'anthropic/claude-opus-4.6' })}
                             ${modelCard({ title: 'Light', copy: 'Fast summaries and lightweight tasks.', inputId: 's-model-light', toggleId: 's-local-light', defaultValue: 'anthropic/claude-sonnet-4.6' })}
                             ${modelCard({ title: 'Fallback', copy: 'Resilience and degraded path.', inputId: 's-model-fallback', toggleId: 's-local-fallback', defaultValue: 'anthropic/claude-sonnet-4.6' })}
                         </div>
                         <div class="form-row">
                             <div class="form-field">
                                 <label>Claude Code Model</label>
-                                <input id="s-claude-code-model" value="claude-opus-4-7[1m]" placeholder="sonnet, opus, claude-opus-4-7[1m], or full name">
+                                <input id="s-claude-code-model" value="claude-opus-4-6[1m]" placeholder="sonnet, opus, claude-opus-4-6[1m], or full name">
                                 <div class="settings-inline-note">Anthropic model for <code>claude_code_edit</code> and <code>advisory_pre_review</code> tools. Requires Anthropic key in Providers.</div>
                             </div>
                         </div>
@@ -519,49 +544,111 @@ export function renderSettingsPage() {
                         </div>
                     </div>
 
+                    <div class="form-section">
+                        <h3>Extension Settings</h3>
+                        <div class="settings-section-copy">
+                            Live extensions can register reviewed, host-rendered settings sections.
+                            Sections appear here after the owning skill is reviewed, enabled, and loaded.
+                        </div>
+                        <div id="extension-settings-sections" class="settings-extension-sections">
+                            <div class="muted">No extension settings registered.</div>
+                        </div>
+                    </div>
+
                     <div class="form-section danger">
                         <h3>Danger Zone</h3>
                         <div class="settings-inline-note">Reset still uses the current restart-based flow. This clears runtime data but keeps the repo.</div>
                         <button class="btn btn-danger" id="btn-reset">Reset All Data</button>
                     </div>
                 </section>
+
+                <section class="settings-panel" data-settings-panel="about">
+                    <div class="about-body">
+                        <img src="/static/logo.jpg" class="about-logo" alt="Ouroboros">
+                        <div>
+                            <h1 class="about-title">Ouroboros</h1>
+                            <p id="about-version" class="about-version"></p>
+                        </div>
+                        <p class="about-desc">
+                            A self-creating AI agent. Not a tool, but a becoming digital personality
+                            with its own constitution, persistent identity, and background consciousness.
+                            Born February 16, 2026.
+                        </p>
+                        <div class="about-credits">
+                            <span>Created by <strong>Anton Razzhigaev</strong> &amp; <strong>Andrew Kaznacheev</strong></span>
+                            <div class="about-links">
+                                <a href="https://t.me/abstractDL" target="_blank" rel="noopener noreferrer">@abstractDL</a>
+                                <a href="https://github.com/joi-lab/ouroboros-desktop" target="_blank" rel="noopener noreferrer">GitHub</a>
+                            </div>
+                        </div>
+                        <div class="about-footer">Joi Lab</div>
+                    </div>
+                </section>
             </div>
 
             <div class="settings-footer">
-                <button type="button" class="btn btn-secondary" id="btn-reload-settings">Reload Settings</button>
-                <button class="btn btn-save" id="btn-save-settings">Save Settings</button>
-                <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" hidden>Unsaved changes.</span>
-                <div id="settings-status" class="settings-inline-status"></div>
+                <div class="settings-footer-actions">
+                    <button type="button" class="btn btn-secondary" id="btn-reload-settings">Reload Settings</button>
+                    <button class="btn btn-save" id="btn-save-settings">Save Settings</button>
+                </div>
+                <div class="settings-footer-status">
+                    <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
+                    <div id="settings-status" class="settings-inline-status"></div>
+                </div>
             </div>
         </div>
     `;
 }
 
-export function bindSettingsTabs(root) {
+export function bindSettingsTabs(root, options = {}) {
     const tabs = Array.from(root.querySelectorAll('.settings-tab'));
     const panels = Array.from(root.querySelectorAll('.settings-panel'));
     const scrollRoot = root.querySelector('.settings-scroll');
+    const state = options.state || null;
+    const onActivate = typeof options.onActivate === 'function' ? options.onActivate : null;
 
+    // v5.7.0: the v5.6.0 drill-down ("settings-subtab-open" + back button)
+    // is gone. On every viewport the tab strip stays as horizontal-scroll
+    // pills (auto-scrolling the active pill into view), and tapping a tab
+    // simply swaps panels in place. The .settings-mobile-back element is
+    // still present in the DOM for back-compat, but is hidden via CSS and
+    // we never bind a handler to it.
     function activate(tabName) {
+        root.dataset.activeSettingsTab = tabName;
+        let activeButton = null;
         tabs.forEach((button) => {
-            button.classList.toggle('active', button.dataset.settingsTab === tabName);
+            const isActive = button.dataset.settingsTab === tabName;
+            button.classList.toggle('active', isActive);
+            if (isActive) activeButton = button;
         });
         panels.forEach((panel) => {
             panel.classList.toggle('active', panel.dataset.settingsPanel === tabName);
         });
         if (scrollRoot) scrollRoot.scrollTop = 0;
+        if (state) state.settingsActiveSubtab = tabName;
+        // Auto-scroll the active pill into the visible part of the strip
+        // on narrow viewports (the strip itself horizontally scrolls).
+        if (activeButton && typeof activeButton.scrollIntoView === 'function') {
+            activeButton.scrollIntoView({
+                behavior: 'auto',
+                inline: 'center',
+                block: 'nearest',
+            });
+        }
+        if (onActivate) onActivate(tabName);
+        window.dispatchEvent(new CustomEvent('ouro:settings-subtab-shown', { detail: { tab: tabName } }));
     }
 
     tabs.forEach((button) => {
         button.addEventListener('click', () => activate(button.dataset.settingsTab));
     });
+    root.activateSettingsTab = activate;
+    if (state && !state.settingsActiveSubtab) state.settingsActiveSubtab = 'providers';
+    root.dataset.activeSettingsTab = state?.settingsActiveSubtab || 'providers';
 }
 
 export function bindSecretInputs(root) {
     root.querySelectorAll('.secret-input').forEach((input) => {
-        input.addEventListener('focus', () => {
-            if (input.value.includes('...')) input.value = '';
-        });
         input.addEventListener('input', () => {
             if (input.value.trim()) delete input.dataset.forceClear;
         });

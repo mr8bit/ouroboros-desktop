@@ -1427,6 +1427,19 @@ class LLMClient:
             prompt_details = usage.get("prompt_tokens_details") or {}
             if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
                 usage["cached_tokens"] = int(prompt_details["cached_tokens"])
+        # NB: LM Studio MLX does NOT emit ``cached_tokens`` anywhere in its
+        # OpenAI-compatible response (verified 2026-05-02 across
+        # ``/v1/chat/completions``, ``/api/v0/chat/completions``, and
+        # streaming with ``stream_options.include_usage=true``). The MLX
+        # backend's prefix-cache stats are written only to LM Studio's
+        # stderr/log output (e.g. ``[cache_wrapper] Prompt cache: using
+        # 70623/70821 tokens from cache``). For LM Studio targets,
+        # ``cached_tokens=0`` in events.jsonl is therefore the *correct*
+        # API-level reading even when the MLX prefix cache is hitting at
+        # >99%. If we ever need cache-hit telemetry for LM Studio, the
+        # right path is the LM Studio native ``/api/v0/chat/completions``
+        # endpoint which exposes ``stats.time_to_first_token`` —
+        # a strong cache-proxy signal — but that is its own follow-up.
 
         if not usage.get("cache_write_tokens"):
             prompt_details_for_write = usage.get("prompt_tokens_details") or {}
@@ -1601,11 +1614,11 @@ class LLMClient:
 
     def default_model(self) -> str:
         """Return the single default model from env. LLM switches via tool if needed."""
-        return os.environ.get("OUROBOROS_MODEL", "anthropic/claude-opus-4.7")
+        return os.environ.get("OUROBOROS_MODEL", "anthropic/claude-opus-4.6")
 
     def available_models(self) -> List[str]:
         """Return list of available models from env (for switch_model tool schema)."""
-        main = os.environ.get("OUROBOROS_MODEL", "anthropic/claude-opus-4.7")
+        main = os.environ.get("OUROBOROS_MODEL", "anthropic/claude-opus-4.6")
         code = os.environ.get("OUROBOROS_MODEL_CODE", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
         models = [main]

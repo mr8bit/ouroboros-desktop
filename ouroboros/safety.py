@@ -38,6 +38,7 @@ from typing import Tuple, Dict, Any, List, Optional
 
 from ouroboros.llm import LLMClient, DEFAULT_LIGHT_MODEL
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost, infer_provider_from_model
+from ouroboros.tool_aliases import adapt_tool_args, canonical_tool_name
 from supervisor.state import update_budget_from_usage
 
 log = logging.getLogger(__name__)
@@ -139,6 +140,10 @@ TOOL_POLICY: Dict[str, str] = {
     # v5.1.2 Frame A: runtime_mode no longer gates execution. We still
     # keep a cheap per-call LLM recheck as defense in depth.
     "skill_exec": POLICY_CHECK,
+    # v5.7.0: read-only argv-only syntax validator for skill payloads
+    # (Python compile() / node --check / bash -n + manifest parse). Heal-allowed.
+    # No state mutation, no shell strings, scrubbed env, 30s/file cap.
+    "skill_preflight": POLICY_SKIP,
 
     # --- Conditional: run_shell (safe-subject whitelist) ---
     "run_shell": POLICY_CHECK_CONDITIONAL,
@@ -718,7 +723,9 @@ def check_safety(
     """
     # Defensive: arguments can be None when the LLM serializes a tool call
     # with no parameters — ``.get()`` on that would AttributeError.
-    arguments = arguments or {}
+    requested_tool_name = str(tool_name or "").strip()
+    tool_name = canonical_tool_name(requested_tool_name)
+    arguments = adapt_tool_args(requested_tool_name, arguments or {})
     policy = TOOL_POLICY.get(tool_name, DEFAULT_POLICY)
 
     if policy == POLICY_SKIP:

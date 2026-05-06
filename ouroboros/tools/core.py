@@ -17,6 +17,166 @@ from ouroboros.utils import read_text, safe_relpath, utc_now_iso
 
 log = logging.getLogger(__name__)
 
+_SKILL_OWNER_STATE_FILENAMES = frozenset({
+    "enabled.json",
+    "grants.json",
+    "review.json",
+    "clawhub.json",
+    # v5.7.0: isolated dependency install state/fingerprint. If agents can
+    # forge ``deps.json`` to {"status":"installed"} they can bypass the
+    # new dependency enable gate. Treat it as owner/lifecycle state.
+    "deps.json",
+})
+
+# v5.7.0: provenance / control-plane sidecars that live INSIDE a payload
+# directory (``data/skills/<bucket>/<skill>/``) but are owned by the
+# launcher/marketplace pipeline, not by the skill author. Any tool that
+# accepts arbitrary user-supplied paths (data_write, run_shell file scan,
+# file_browser_api delete/upload, heal-mode write check) consults
+# ``is_skill_control_plane_path`` to refuse writes to these markers.
+# Pre-v5.7.0 these names were only protected in heal mode, leaving normal
+# tool flows free to overwrite provenance.
+_SKILL_PAYLOAD_CONTROL_PLANE_FILENAMES = frozenset({
+    ".clawhub.json",
+    ".ouroboroshub.json",
+    "skill.openclaw.md",
+    ".seed-origin",
+})
+
+_SKILL_PAYLOAD_CONTROL_PLANE_DIRNAMES = frozenset({
+    ".ouroboros_env",
+    "node_modules",
+})
+
+# Buckets in ``data/skills/<bucket>/<skill>/`` where the payload
+# control-plane filenames are protected. We deliberately list every
+# bucket the launcher / marketplace pipelines own (native is launcher-
+# seeded, the others are user/marketplace-installed).
+_SKILL_PAYLOAD_BUCKETS = frozenset({
+    "native",
+    "external",
+    "clawhub",
+    "ouroboroshub",
+})
+
+
+def _is_skill_owner_state_target(target: pathlib.Path, data_root: pathlib.Path) -> bool:
+    if target.name.lower() not in _SKILL_OWNER_STATE_FILENAMES:
+        return False
+    try:
+        rel_to_data = target.relative_to(data_root)
+        parts = rel_to_data.parts
+        if (
+            len(parts) == 4
+            and parts[0].lower() == "state"
+            and parts[1].lower() == "skills"
+        ):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        rel_to_data = target.resolve(strict=False).relative_to(data_root)
+        parts = rel_to_data.parts
+        if (
+            len(parts) == 4
+            and parts[0].lower() == "state"
+            and parts[1].lower() == "skills"
+        ):
+            return True
+    except (OSError, ValueError):
+        pass
+    skills_state_root = data_root / "state" / "skills"
+    if not skills_state_root.is_dir():
+        return False
+    try:
+        target_parent = target.parent.resolve(strict=False)
+    except OSError:
+        return False
+    for skill_state_dir in skills_state_root.iterdir():
+        try:
+            if skill_state_dir.resolve(strict=False) == target_parent:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def is_skill_control_plane_path(target: pathlib.Path, data_root: pathlib.Path) -> bool:
+    """Return True if ``target`` is a skill provenance / control-plane
+    file that must NEVER be edited via generic file-write tooling.
+
+    Two surfaces qualify:
+
+    1. ``data/state/skills/<skill>/{enabled,grants,review,clawhub}.json``
+       (launcher-owned trust state — already covered by
+       ``_is_skill_owner_state_target`` for back-compat callers).
+    2. ``data/skills/<bucket>/<skill>/`` payload sidecars that the
+       launcher / marketplace pipelines own:
+       ``.clawhub.json``, ``.ouroboroshub.json``, ``SKILL.openclaw.md``,
+       ``.seed-origin`` (case-insensitive on the filename).
+
+    Symlinks are resolved so a payload-local symlink like
+    ``notes.txt -> .clawhub.json`` still trips the guard.
+    """
+    if _is_skill_owner_state_target(target, data_root):
+        return True
+
+    def _matches_payload(candidate: pathlib.Path) -> bool:
+        try:
+            rel = candidate.relative_to(data_root)
+        except (OSError, ValueError):
+            return False
+        parts = rel.parts
+        # ``skills/<bucket>/<skill>/<filename>`` = 4 parts.
+        if len(parts) < 4:
+            return False
+        if parts[0].lower() != "skills":
+            return False
+        if parts[1].lower() not in _SKILL_PAYLOAD_BUCKETS:
+            return False
+        rel_tail = [part.lower() for part in parts[3:]]
+        if any(part in _SKILL_PAYLOAD_CONTROL_PLANE_DIRNAMES for part in rel_tail):
+            return True
+        return candidate.name.lower() in _SKILL_PAYLOAD_CONTROL_PLANE_FILENAMES
+
+    if _matches_payload(target):
+        return True
+
+    # Resolve symlinks so a payload-local symlink or benign-looking path
+    # like ``notes.txt -> .clawhub.json`` still trips the guard. Pre-v5.7.0
+    # review found our first implementation checked basename before
+    # resolving, which missed this exact shape.
+    try:
+        resolved = pathlib.Path(target).resolve(strict=False)
+    except OSError:
+        resolved = pathlib.Path(target)
+    if _matches_payload(resolved):
+        return True
+
+    # Hardlink/inode defense: if ``target`` exists and points to the same
+    # inode as a protected sidecar in the same payload directory, a benign
+    # basename would otherwise bypass the name-based guard. Samefile is
+    # the portable API here (works on APFS/NTFS case-insensitive FS too).
+    try:
+        if not pathlib.Path(target).exists():
+            return False
+        rel = pathlib.Path(target).resolve(strict=False).relative_to(data_root)
+        parts = rel.parts
+        if len(parts) < 4 or parts[0].lower() != "skills" or parts[1].lower() not in _SKILL_PAYLOAD_BUCKETS:
+            return False
+        payload_root = data_root / parts[0] / parts[1] / parts[2]
+        for protected in payload_root.iterdir():
+            if protected.name.lower() not in _SKILL_PAYLOAD_CONTROL_PLANE_FILENAMES:
+                continue
+            try:
+                if protected.exists() and pathlib.Path(target).samefile(protected):
+                    return True
+            except OSError:
+                continue
+    except (OSError, ValueError):
+        return False
+    return False
+
 
 def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]:
     target = (root / safe_relpath(rel)).resolve()
@@ -37,9 +197,38 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]
     return items
 
 
+_MEMORY_AT_DRIVE_MEMORY = frozenset({
+    "identity.md", "scratchpad.md", "dialogue_summary.md",
+    "dialogue_blocks.json", "registry.md", "deep_review.md",
+    "WORLD.md",
+})
+
+
 def _repo_read(ctx: ToolContext, path: str, max_lines: int = 2000, start_line: int = 1) -> str:
-    """Read a file from the repo, optionally slicing to a line range."""
-    content = read_text(ctx.repo_path(path))
+    """Read a file from the repo, optionally slicing to a line range.
+
+    When the requested path is a known memory artifact (identity.md,
+    scratchpad.md, etc.) at the repo root level, return a hint rather than
+    letting an opaque ENOENT scroll past. These files live at
+    ``data_root/memory/``; some are already present in context, and all raw
+    memory files should be read through ``data_read`` rather than ``repo_read``.
+    """
+    try:
+        content = read_text(ctx.repo_path(path))
+    except FileNotFoundError:
+        norm = path.strip().lstrip("./").replace("\\", "/")
+        base = norm.rsplit("/", 1)[-1]
+        if "/" not in norm and base in _MEMORY_AT_DRIVE_MEMORY:
+            title = base.split('.')[0].title()
+            return (
+                f"⚠️ NOT_FOUND: '{path}' is not at the repo root.\n\n"
+                f"This file lives at `data_root/memory/{base}`, not in the "
+                f"git repo. Some memory artifacts are already summarized in "
+                f"context as `## {title}`, but raw memory state must be read "
+                f"from the data root. If you need the raw file, call "
+                f"`data_read(path='memory/{base}')`."
+            )
+        raise
     lines = content.splitlines(keepends=True)
     total = len(lines)
     start = max(1, min(start_line, total + 1))
@@ -55,7 +244,52 @@ def _repo_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
 
 
 def _data_read(ctx: ToolContext, path: str) -> str:
-    return read_text(ctx.drive_path(path))
+    """Read a UTF-8 text file from the drive (relative to drive_root).
+
+    Paths that include the drive_root prefix (e.g.
+    ``.tmp-data-qwen-coder-next/data/memory/identity.md`` or the absolute
+    ``/Users/.../data/memory/...``) used to silently fail with ENOENT
+    because ``drive_path()`` prepends drive_root again, producing a doubled
+    path. Strip the duplicate prefix when we recognize one so the call works
+    rather than burning a round on a confusing path-doubling error.
+    """
+    norm = str(path).strip().replace("\\", "/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    drive_str = str(ctx.drive_root).rstrip("/")
+    drive_no_lead = drive_str.lstrip("/")
+    if drive_no_lead and norm.lstrip("/").startswith(drive_no_lead):
+        stripped = norm.lstrip("/")
+        norm = stripped[len(drive_no_lead):].lstrip("/")
+    elif norm.startswith(".tmp-data-") or norm.lstrip("/").startswith(".tmp-data-"):
+        candidate = norm.lstrip("/")
+        first_slash = candidate.find("/")
+        if first_slash > 0:
+            after = candidate[first_slash + 1:]
+            if after.startswith("data/"):
+                norm = after[len("data/"):]
+            else:
+                norm = after
+    try:
+        return read_text(ctx.drive_path(norm))
+    except FileNotFoundError:
+        if norm.replace("\\", "/").startswith("memory/"):
+            explanation = (
+                "Memory artifacts under memory/ are created lazily on first "
+                "write. Treat this as an empty/absent state and proceed with "
+                "initialization if that is the task."
+            )
+        else:
+            explanation = (
+                "This path does not exist yet. Treat it as an empty/absent "
+                "state. Lazy-creation is not guaranteed for paths outside "
+                "memory/; if this path was expected to exist, verify it was "
+                "written correctly."
+            )
+        return (
+            f"⚠️ DATA_NOT_YET_CREATED: {path}\n\n"
+            f"{explanation} Use data_list to confirm what currently exists."
+        )
 
 
 def _data_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
@@ -80,32 +314,43 @@ def _data_write(ctx: ToolContext, path: str, content: str, mode: str = "overwrit
     from ouroboros import config as _cfg
     target_path = pathlib.Path(p)
     settings_path = pathlib.Path(_cfg.SETTINGS_PATH)
-    grants_path = False
-    try:
-        rel_to_data = target_path.resolve(strict=False).relative_to(pathlib.Path(_cfg.DATA_DIR).resolve(strict=False))
-        parts = rel_to_data.parts
-        grants_path = (
-            len(parts) == 4
-            and parts[0].lower() == "state"
-            and parts[1].lower() == "skills"
-            and parts[3].lower() == "grants.json"
-        )
-    except (OSError, ValueError):
-        grants_path = False
-    if not grants_path:
-        grants_root = pathlib.Path(_cfg.DATA_DIR) / "state" / "skills"
-        if target_path.exists() and grants_root.is_dir():
-            for grant_file in grants_root.glob("*/grants.json"):
+    data_root = pathlib.Path(_cfg.DATA_DIR).resolve(strict=False)
+    lexical_target = pathlib.Path(ctx.drive_root).resolve(strict=False) / safe_relpath(path)
+    skill_owner_state_path = (
+        _is_skill_owner_state_target(lexical_target, data_root)
+        or _is_skill_owner_state_target(target_path, data_root)
+    )
+    if not skill_owner_state_path:
+        skills_state_root = pathlib.Path(_cfg.DATA_DIR) / "state" / "skills"
+        if target_path.exists() and skills_state_root.is_dir():
+            for owner_state_file in skills_state_root.glob("*/*"):
+                if owner_state_file.name.lower() not in _SKILL_OWNER_STATE_FILENAMES:
+                    continue
                 try:
-                    if grant_file.exists() and target_path.samefile(grant_file):
-                        grants_path = True
+                    if owner_state_file.exists() and target_path.samefile(owner_state_file):
+                        skill_owner_state_path = True
                         break
                 except OSError:
                     continue
-    if grants_path:
+    if skill_owner_state_path:
         return (
-            "⚠️ DATA_WRITE_BLOCKED: skill grants are owner-only state. "
-            "Use the desktop launcher confirmation flow from the Skills UI."
+            "⚠️ DATA_WRITE_BLOCKED: skill review, enablement, grants, and "
+            "marketplace provenance are owner/review controlled state. Edit "
+            "the skill payload under data/skills/ and use review_skill, the "
+            "Skills UI toggle, or the desktop launcher grant flow."
+        )
+    # v5.7.0: extend the control-plane block to payload-side provenance
+    # sidecars (.clawhub.json / .ouroboroshub.json / SKILL.openclaw.md
+    # / .seed-origin) for ALL data_write calls, not just heal mode. The
+    # marketplace adapter and launcher own these markers; rewriting them
+    # via generic tools could launder provenance or detach a launcher-
+    # seeded skill from its update lane.
+    if is_skill_control_plane_path(lexical_target, data_root) or is_skill_control_plane_path(target_path, data_root):
+        return (
+            "⚠️ DATA_WRITE_BLOCKED: marketplace provenance and launcher "
+            "seed markers (.clawhub.json, .ouroboroshub.json, "
+            "SKILL.openclaw.md, .seed-origin) are owner/review controlled. "
+            "Edit the payload's user-authored files instead and rerun review_skill."
         )
     matches = False
     try:

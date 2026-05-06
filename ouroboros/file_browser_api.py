@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import pathlib
@@ -9,6 +10,8 @@ import shutil
 from contextlib import suppress
 from typing import Any
 from urllib.parse import quote
+
+log = logging.getLogger(__name__)
 
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
@@ -24,11 +27,62 @@ _FILE_BROWSER_MAX_PREVIEW_CHARS = 120_000
 _FILE_BROWSER_UPLOAD_CHUNK_SIZE = 1024 * 1024
 _FILE_BROWSER_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _IMAGE_PREVIEW_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+_PDF_PREVIEW_EXTENSIONS = {".pdf"}
 _TEXT_PREVIEW_EXTENSIONS = {
     ".py", ".md", ".txt", ".json", ".jsonl", ".toml", ".yml", ".yaml",
     ".js", ".css", ".html", ".ts", ".tsx", ".jsx", ".ini", ".cfg",
     ".sh", ".zsh", ".bash", ".ps1", ".env", ".xml", ".csv",
 }
+_SKILL_OWNER_STATE_FILENAMES = frozenset({
+    "enabled.json",
+    "grants.json",
+    "review.json",
+    "clawhub.json",
+    "deps.json",
+})
+
+
+def _is_skill_owner_state_target(target: pathlib.Path) -> bool:
+    if target.name.lower() not in _SKILL_OWNER_STATE_FILENAMES:
+        return False
+    from ouroboros import config as _cfg
+    data_root = pathlib.Path(_cfg.DATA_DIR).resolve(strict=False)
+    try:
+        rel = target.relative_to(data_root)
+        parts = rel.parts
+        if (
+            len(parts) == 4
+            and parts[0].lower() == "state"
+            and parts[1].lower() == "skills"
+        ):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        rel = target.resolve(strict=False).relative_to(data_root)
+        parts = rel.parts
+        if (
+            len(parts) == 4
+            and parts[0].lower() == "state"
+            and parts[1].lower() == "skills"
+        ):
+            return True
+    except (OSError, ValueError):
+        pass
+    skills_state_root = data_root / "state" / "skills"
+    if not skills_state_root.is_dir():
+        return False
+    try:
+        target_parent = target.parent.resolve(strict=False)
+    except OSError:
+        return False
+    for skill_state_dir in skills_state_root.iterdir():
+        try:
+            if skill_state_dir.resolve(strict=False) == target_parent:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 class FileBrowserPayloadTooLarge(ValueError):
@@ -107,17 +161,22 @@ def _is_owner_only_settings_file(target: pathlib.Path) -> bool:
 def _is_owner_only_file(target: pathlib.Path) -> bool:
     if _is_owner_only_settings_file(target):
         return True
+    if _is_skill_owner_state_target(target):
+        return True
     from ouroboros import config as _cfg
-    grants_root = pathlib.Path(_cfg.DATA_DIR) / "state" / "skills"
-    if target.exists() and grants_root.is_dir():
-        for grant_file in grants_root.glob("*/grants.json"):
+    data_root = pathlib.Path(_cfg.DATA_DIR).resolve(strict=False)
+    skills_state_root = pathlib.Path(_cfg.DATA_DIR) / "state" / "skills"
+    if target.exists() and skills_state_root.is_dir():
+        for owner_state_file in skills_state_root.glob("*/*"):
+            if owner_state_file.name.lower() not in _SKILL_OWNER_STATE_FILENAMES:
+                continue
             try:
-                if grant_file.exists() and target.samefile(grant_file):
+                if owner_state_file.exists() and target.samefile(owner_state_file):
                     return True
             except OSError:
                 continue
     try:
-        rel = target.resolve(strict=False).relative_to(pathlib.Path(_cfg.DATA_DIR).resolve(strict=False))
+        rel = target.resolve(strict=False).relative_to(data_root)
     except (OSError, ValueError):
         return False
     parts = rel.parts
@@ -125,7 +184,7 @@ def _is_owner_only_file(target: pathlib.Path) -> bool:
         len(parts) == 4
         and parts[0].lower() == "state"
         and parts[1].lower() == "skills"
-        and parts[3].lower() == "grants.json"
+        and parts[3].lower() in _SKILL_OWNER_STATE_FILENAMES
     )
 
 
@@ -143,14 +202,66 @@ def _contains_owner_only_file(target: pathlib.Path) -> bool:
     return False
 
 
+def _is_skill_control_plane_api_target(target: pathlib.Path) -> bool:
+    """Return True for skill payload provenance / launcher sidecars.
+
+    File Browser endpoints bypass ``tools/core._data_write`` and touch the
+    filesystem directly, so every mutating route must re-apply the same
+    control-plane guard. This wrapper keeps import/config errors best-effort:
+    unrelated file-browser paths should not brick if config is unavailable
+    during early startup.
+    """
+    try:
+        from ouroboros.config import DATA_DIR
+        from ouroboros.tools.core import is_skill_control_plane_path
+
+        data_root = pathlib.Path(DATA_DIR).resolve(strict=False)
+        return is_skill_control_plane_path(pathlib.Path(target), data_root)
+    except Exception:
+        log.debug("control-plane guard probe failed in file_browser_api", exc_info=True)
+        return False
+
+
+def _contains_skill_control_plane_file(target: pathlib.Path) -> bool:
+    """Recursive version of ``_is_skill_control_plane_api_target``.
+
+    Used for directory delete/transfer so a whole payload directory cannot be
+    removed or copied/moved through the generic file browser while it contains
+    provenance/seed/deps control-plane files.
+    """
+    if _is_skill_control_plane_api_target(target):
+        return True
+    if not target.is_dir():
+        return False
+    try:
+        for child in target.rglob("*"):
+            if _is_skill_control_plane_api_target(child):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+_CONTROL_PLANE_FILES_API_ERROR = JSONResponse(
+    {
+        "error": (
+            "Refusing to modify skill provenance / launcher seed marker "
+            "(.clawhub.json, .ouroboroshub.json, SKILL.openclaw.md, .seed-origin). "
+            "Use marketplace Uninstall/Update flows or edit user-authored payload files instead."
+        ),
+    },
+    status_code=400,
+)
+
+
 # Standard error response for the Files API guard. Matches the wording
 # of ``tools/core.py::_data_write`` so the operator hears one consistent
 # message regardless of which surface they used.
 _OWNER_ONLY_FILES_API_ERROR = JSONResponse(
     {
         "error": (
-            "settings.json and skill grants are owner-edited state and cannot "
-            "be modified through the Files API. Owner-controlled values "
+            "settings.json and skill review/enablement/grant/provenance state "
+            "cannot be modified through the Files API. Owner-controlled values "
             "(OUROBOROS_RUNTIME_MODE, credentials, A2A bind/expose, review "
             "enforcement) are not agent-mutable. Stop the agent, edit "
             "~/Ouroboros/data/settings.json directly, then restart."
@@ -304,7 +415,24 @@ async def api_files_read(request: Request) -> JSONResponse:
                 "size": size,
                 "is_text": False,
                 "is_image": True,
+                "is_pdf": False,
                 "media_type": _guess_media_type(target),
+                "content_url": f"/api/files/content?path={encoded_rel}",
+                "content": "",
+                "truncated": False,
+            })
+        if target.suffix.lower() in _PDF_PREVIEW_EXTENSIONS:
+            encoded_rel = quote(rel, safe="/")
+            return JSONResponse({
+                "root_path": str(root_dir),
+                "path": rel,
+                "display_path": _format_path(root_dir, rel),
+                "name": target.name,
+                "size": size,
+                "is_text": False,
+                "is_image": False,
+                "is_pdf": True,
+                "media_type": "application/pdf",
                 "content_url": f"/api/files/content?path={encoded_rel}",
                 "content": "",
                 "truncated": False,
@@ -318,6 +446,7 @@ async def api_files_read(request: Request) -> JSONResponse:
                 "size": size,
                 "is_text": False,
                 "is_image": False,
+                "is_pdf": False,
                 "content": "",
                 "truncated": False,
             })
@@ -337,6 +466,7 @@ async def api_files_read(request: Request) -> JSONResponse:
             "size": size,
             "is_text": True,
             "is_image": False,
+            "is_pdf": False,
             "content": text,
             "truncated": truncated,
         })
@@ -398,6 +528,8 @@ async def api_files_write(request: Request) -> JSONResponse:
         root_dir, target, _ = _resolve_target(request, rel_path)
         if _contains_owner_only_file(target):
             return _OWNER_ONLY_FILES_API_ERROR
+        if _contains_skill_control_plane_file(target):
+            return _CONTROL_PLANE_FILES_API_ERROR
         if not target.exists():
             if not create:
                 return JSONResponse({"error": f"Path not found: {rel_path}"}, status_code=404)
@@ -471,6 +603,8 @@ async def api_files_mkdir(request: Request) -> JSONResponse:
         destination = target_dir / name
         if _is_owner_only_file(destination):
             return _OWNER_ONLY_FILES_API_ERROR
+        if _is_skill_control_plane_api_target(destination):
+            return _CONTROL_PLANE_FILES_API_ERROR
         if destination.exists():
             return JSONResponse({"error": f"Path already exists: {name}"}, status_code=409)
         destination.mkdir(parents=False, exist_ok=False)
@@ -505,6 +639,8 @@ async def api_files_delete(request: Request) -> JSONResponse:
             return JSONResponse({"error": "Refusing to delete the configured root directory."}, status_code=400)
         if _contains_owner_only_file(target):
             return _OWNER_ONLY_FILES_API_ERROR
+        if _contains_skill_control_plane_file(target):
+            return _CONTROL_PLANE_FILES_API_ERROR
         if not target.exists():
             return JSONResponse({"error": f"Path not found: {rel_path}"}, status_code=404)
 
@@ -553,15 +689,21 @@ async def api_files_transfer(request: Request) -> JSONResponse:
         # = "overwrite settings.json with arbitrary content".
         if _contains_owner_only_file(source):
             return _OWNER_ONLY_FILES_API_ERROR
+        if _contains_skill_control_plane_file(source):
+            return _CONTROL_PLANE_FILES_API_ERROR
         destination_check = dest_dir / source.name
         if _is_owner_only_file(destination_check):
             return _OWNER_ONLY_FILES_API_ERROR
+        if _is_skill_control_plane_api_target(destination_check):
+            return _CONTROL_PLANE_FILES_API_ERROR
         if source.is_dir():
             try:
                 for child in source.rglob("*"):
                     projected = destination_check / child.relative_to(source)
                     if _is_owner_only_file(projected):
                         return _OWNER_ONLY_FILES_API_ERROR
+                    if _is_skill_control_plane_api_target(projected):
+                        return _CONTROL_PLANE_FILES_API_ERROR
                     if child.is_symlink():
                         try:
                             resolved = child.resolve(strict=True)
@@ -571,10 +713,14 @@ async def api_files_transfer(request: Request) -> JSONResponse:
                             for linked_child in resolved.rglob("*"):
                                 if _is_owner_only_file(projected / linked_child.relative_to(resolved)):
                                     return _OWNER_ONLY_FILES_API_ERROR
+                                if _is_skill_control_plane_api_target(projected / linked_child.relative_to(resolved)):
+                                    return _CONTROL_PLANE_FILES_API_ERROR
             except OSError:
                 pass
         elif _is_owner_only_file(destination_check):
             return _OWNER_ONLY_FILES_API_ERROR
+        elif _is_skill_control_plane_api_target(destination_check):
+            return _CONTROL_PLANE_FILES_API_ERROR
         if not source.exists():
             return JSONResponse({"error": f"Path not found: {source_rel}"}, status_code=404)
         if not dest_dir.exists():
@@ -639,6 +785,8 @@ async def api_files_upload(request: Request) -> JSONResponse:
         # uploads that resolve to the owner-only settings file.
         if _is_owner_only_file(destination):
             return _OWNER_ONLY_FILES_API_ERROR
+        if _is_skill_control_plane_api_target(destination):
+            return _CONTROL_PLANE_FILES_API_ERROR
         if destination.exists():
             return JSONResponse({"error": f"File already exists: {filename}"}, status_code=409)
 

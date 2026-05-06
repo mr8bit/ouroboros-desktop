@@ -1,7 +1,8 @@
 import { refreshModelCatalog } from './settings_catalog.js';
-import { bindEffortSegments, bindModelPickers, syncEffortSegments } from './settings_controls.js';
+import { bindEffortSegments, syncEffortSegments } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
+import { formatDualVersion } from './utils.js';
 
 function byId(id) {
     return document.getElementById(id);
@@ -41,6 +42,115 @@ function resetSecretClearFlags(root) {
     });
 }
 
+function renderExtensionSettingsSections(root, sections) {
+    const host = root.querySelector('#extension-settings-sections');
+    if (!host) return;
+    const items = Array.isArray(sections) ? sections : [];
+    if (!items.length) {
+        host.innerHTML = '<div class="muted">No extension settings registered.</div>';
+        return;
+    }
+    const cleanExtensionRoute = (value) => {
+        const route = String(value || '').trim().replace(/^\/+/, '');
+        const parts = route.split('/').filter(Boolean);
+        if (!route || route.includes('\\') || parts.some((part) => part === '.' || part === '..')) {
+            return '';
+        }
+        return parts.map(encodeURIComponent).join('/');
+    };
+    const fieldHtml = (field) => {
+        const name = escapeHtml(field.name || '');
+        const label = escapeHtml(field.label || field.name || '');
+        const placeholder = escapeHtml(field.placeholder || '');
+        const type = String(field.type || 'text');
+        if (type === 'textarea') {
+            return `<label class="form-field"><span>${label}</span><textarea name="${name}" placeholder="${placeholder}"></textarea></label>`;
+        }
+        if (type === 'checkbox') {
+            return `<label class="settings-extension-checkbox"><input type="checkbox" name="${name}"><span>${label}</span></label>`;
+        }
+        return `<label class="form-field"><span>${label}</span><input name="${name}" type="${escapeHtml(type)}" placeholder="${placeholder}"></label>`;
+    };
+    const componentHtml = (section, component, idx) => {
+        const type = String(component.type || '');
+        if (type === 'markdown') {
+            return `<div class="settings-section-copy">${escapeHtml(component.text || '')}</div>`;
+        }
+        if (type === 'json') {
+            return `<details class="widget-json"><summary>${escapeHtml(component.label || 'JSON')}</summary><pre>${escapeHtml(JSON.stringify(component.value || component.data || {}, null, 2))}</pre></details>`;
+        }
+        if (type === 'form' || type === 'action') {
+            const fields = Array.isArray(component.fields) ? component.fields : [];
+            const route = cleanExtensionRoute(component.route || component.api_route || '');
+            if (!route) {
+                return '<div class="settings-inline-note">Invalid extension settings route.</div>';
+            }
+            return `
+                <form class="settings-extension-form" data-extension-settings-form data-skill="${escapeHtml(section.skill || '')}" data-route="${escapeHtml(route)}">
+                    <div class="form-grid two">${fields.map(fieldHtml).join('')}</div>
+                    <button class="btn btn-primary btn-sm" type="submit">${escapeHtml(component.submit_label || component.label || 'Save')}</button>
+                    <div class="settings-inline-status" data-extension-settings-status></div>
+                </form>
+            `;
+        }
+        return `<div class="settings-inline-note">Unsupported extension settings component ${idx + 1}: ${escapeHtml(type || 'unknown')}</div>`;
+    };
+    host.innerHTML = items.map((section) => {
+        const title = escapeHtml(section.title || section.section_id || section.key || 'Extension settings');
+        const skill = escapeHtml(section.skill || '');
+        const components = Array.isArray(section.render?.components) ? section.render.components : [];
+        return `
+            <article class="settings-extension-section">
+                <div class="settings-extension-section-head">
+                    <strong>${title}</strong>
+                    ${skill ? `<span class="settings-inline-note">from ${skill}</span>` : ''}
+                </div>
+                <div class="settings-extension-components">
+                    ${components.length ? components.map((component, idx) => componentHtml(section, component, idx)).join('') : '<div class="muted">No declarative components.</div>'}
+                </div>
+            </article>
+        `;
+    }).join('');
+    host.querySelectorAll('[data-extension-settings-form]').forEach((form) => {
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const status = form.querySelector('[data-extension-settings-status]');
+            const skill = form.dataset.skill || '';
+            const route = form.dataset.route || '';
+            if (!skill || !route) return;
+            const values = {};
+            new FormData(form).forEach((value, key) => { values[key] = value; });
+            form.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+                values[input.name] = input.checked;
+            });
+            if (status) {
+                status.textContent = 'Saving...';
+                status.dataset.tone = 'muted';
+            }
+            try {
+                const cleanRoute = cleanExtensionRoute(route);
+                if (!cleanRoute) throw new Error('invalid extension settings route');
+                const resp = await fetch(`/api/extensions/${encodeURIComponent(skill)}/${cleanRoute}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(values),
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+                if (status) {
+                    status.textContent = data.message || 'Saved.';
+                    status.dataset.tone = 'ok';
+                }
+            } catch (err) {
+                if (status) {
+                    status.textContent = err.message || String(err);
+                    status.dataset.tone = 'danger';
+                }
+            }
+        });
+    });
+}
+
 function collectSecretValue(id, body) {
     const input = byId(id);
     if (!input) return;
@@ -54,18 +164,54 @@ function collectSecretValue(id, body) {
     if (value && !value.includes('...')) body[settingKey] = value;
 }
 
-export function initSettings({ state }) {
+const SETTINGS_FALLBACK_MODELS = [
+    'anthropic::claude-opus-4-6',
+    'anthropic::claude-sonnet-4-6',
+    'openai::gpt-5.5',
+    'openai::gpt-5.5-mini',
+    'openai/gpt-5.5',
+    'anthropic/claude-opus-4.6',
+    'google/gemini-3.1-pro-preview',
+];
+
+let settingsModelCatalogItems = SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Suggested model' }));
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+export function initSettings({ state, setBeforePageLeave } = {}) {
     const page = document.createElement('div');
     page.id = 'page-settings';
     page.className = 'page';
     page.innerHTML = renderSettingsPage();
     document.getElementById('content').appendChild(page);
 
-    bindSettingsTabs(page);
+    const activateSettingsTab = (tabName) => {
+        if (typeof page.activateSettingsTab === 'function') {
+            page.activateSettingsTab(tabName);
+        }
+    };
+    bindSettingsTabs(page, { state });
     bindSecretInputs(page);
     bindEffortSegments(page);
-    bindModelPickers(page);
     bindLocalModelControls({ state });
+    // Populate the About sub-tab version label from /api/health so the
+    // existing #nav-version short label and the in-Settings detailed version
+    // string stay consistent. The fetch is best-effort — if it fails the
+    // label simply remains empty rather than blocking settings load.
+    fetch('/api/health')
+        .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+        .then((d) => {
+            const verEl = document.getElementById('about-version');
+            if (verEl) verEl.textContent = formatDualVersion(d);
+        })
+        .catch(() => { /* about version is best-effort */ });
     let currentSettings = {};
     let claudeCodePollStarted = false;
     // v4.33.1 status_label priority fix: even when the user has not configured
@@ -132,14 +278,17 @@ export function initSettings({ state }) {
     }
 
     function snapshotSettingsDraft() {
-        return JSON.stringify(collectBody());
+        return JSON.stringify({
+            ...collectBody(),
+            OUROBOROS_RUNTIME_MODE_DRAFT: byId('s-runtime-mode')?.value || 'advanced',
+        });
     }
 
     function setSettingsCleanBaseline() {
         settingsBaseline = snapshotSettingsDraft();
         settingsDirty = false;
         const indicator = byId('settings-unsaved-indicator');
-        if (indicator) indicator.hidden = true;
+        if (indicator) indicator.classList.remove('is-visible');
     }
 
     function updateSettingsDirtyState() {
@@ -148,7 +297,14 @@ export function initSettings({ state }) {
         if (nextDirty === settingsDirty) return;
         settingsDirty = nextDirty;
         const indicator = byId('settings-unsaved-indicator');
-        if (indicator) indicator.hidden = !settingsDirty;
+        if (indicator) indicator.classList.toggle('is-visible', settingsDirty);
+    }
+
+    function discardUnsavedSettingsDraft() {
+        closeSettingsModelPickers();
+        applySettings(currentSettings || {});
+        setSettingsCleanBaseline();
+        setStatus('', 'ok');
     }
 
     function applyClaudeCodeStatus(payload = {}) {
@@ -219,6 +375,7 @@ export function initSettings({ state }) {
         applyInputValue('s-cloudru-base-url', s.CLOUDRU_FOUNDATION_MODELS_BASE_URL);
         applyInputValue('s-anthropic', s.ANTHROPIC_API_KEY);
         applyInputValue('s-network-password', s.OUROBOROS_NETWORK_PASSWORD);
+        applyInputValue('s-server-host', s.OUROBOROS_SERVER_HOST || '127.0.0.1');
         applyInputValue('s-telegram-token', s.TELEGRAM_BOT_TOKEN);
         applyInputValue('s-telegram-chat-id', s.TELEGRAM_CHAT_ID);
 
@@ -279,15 +436,19 @@ export function initSettings({ state }) {
         const hint = document.getElementById('settings-lan-hint');
         if (!hint || !meta) return;
         if (meta.reachability === 'loopback_only') {
-            hint.innerHTML = '🔒 Bound to <code>localhost</code> — only accessible from this machine. To allow LAN access, restart with <code>OUROBOROS_SERVER_HOST=0.0.0.0</code>.';
+            hint.innerHTML = 'Bound to <code>localhost</code>: only accessible from this machine. Set Server Bind Host to <code>0.0.0.0</code>, save, and restart for LAN access.';
             hint.dataset.tone = 'info';
             hint.hidden = false;
         } else if (meta.reachability === 'lan_reachable') {
-            hint.innerHTML = `🌐 Accessible on your local network at <a href="${meta.recommended_url}" target="_blank" rel="noopener">${meta.recommended_url}</a>${meta.warning ? ' — <em>' + meta.warning + '</em>' : ''}`;
-            hint.dataset.tone = 'ok';
+            const url = escapeHtml(meta.recommended_url || '');
+            const warning = escapeHtml(meta.warning || '');
+            hint.innerHTML = `LAN URL: <a href="${url}" target="_blank" rel="noopener">${url}</a>${warning ? ' — <strong>' + warning + '</strong>' : ''}`;
+            hint.dataset.tone = meta.warning ? 'warn' : 'ok';
             hint.hidden = false;
         } else if (meta.reachability === 'host_ip_unknown') {
-            hint.innerHTML = `⚠️ Server is listening on non-localhost but LAN IP could not be detected automatically. Try <code>${meta.recommended_url}</code>.${meta.warning ? ' ' + meta.warning : ''}`;
+            const url = escapeHtml(meta.recommended_url || '');
+            const warning = escapeHtml(meta.warning || '');
+            hint.innerHTML = `Server is listening on non-localhost but LAN IP could not be detected automatically. Try <code>${url}</code>.${warning ? ' <strong>' + warning + '</strong>' : ''}`;
             hint.dataset.tone = 'warn';
             hint.hidden = false;
         } else {
@@ -296,12 +457,21 @@ export function initSettings({ state }) {
     }
 
     async function loadSettings() {
-        const resp = await fetch('/api/settings', { cache: 'no-store' });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const [settingsResp, extResp] = await Promise.all([
+            fetch('/api/settings', { cache: 'no-store' }),
+            fetch('/api/extensions', { cache: 'no-store' }).catch(() => null),
+        ]);
+        const data = await settingsResp.json().catch(() => ({}));
+        const extData = extResp && extResp.ok ? await extResp.json().catch(() => ({})) : {};
+        const sections = Array.isArray(extData?.live?.settings_sections)
+            ? extData.live.settings_sections
+            : [];
+        if (!settingsResp.ok) throw new Error(data.error || `HTTP ${settingsResp.status}`);
         currentSettings = data;
         applySettings(data);
+        renderExtensionSettingsSections(page, sections);
         setSettingsCleanBaseline();
+        closeSettingsModelPickers();
         _renderNetworkHint(data._meta);
         renderClaudeCodeUi();
         settingsLoaded = true;
@@ -321,7 +491,7 @@ export function initSettings({ state }) {
             await loadSettings();
             try {
                 await refreshModelCatalog();
-                setStatus('Settings loaded.', 'ok');
+                setStatus('Settings loaded', 'ok');
             } catch (error) {
                 setStatus(
                     `Settings loaded. Model catalog refresh failed: ${error.message || error}`,
@@ -344,7 +514,8 @@ export function initSettings({ state }) {
             OUROBOROS_MODEL_CODE: byId('s-model-code').value,
             OUROBOROS_MODEL_LIGHT: byId('s-model-light').value,
             OUROBOROS_MODEL_FALLBACK: byId('s-model-fallback').value,
-            CLAUDE_CODE_MODEL: byId('s-claude-code-model').value || 'claude-opus-4-7[1m]',
+            CLAUDE_CODE_MODEL: byId('s-claude-code-model').value || 'claude-opus-4-6[1m]',
+            OUROBOROS_SERVER_HOST: (byId('s-server-host')?.value || '127.0.0.1').trim() || '127.0.0.1',
             OUROBOROS_EFFORT_TASK: byId('s-effort-task').value,
             OUROBOROS_EFFORT_EVOLUTION: byId('s-effort-evolution').value,
             OUROBOROS_EFFORT_REVIEW: byId('s-effort-review').value,
@@ -429,6 +600,15 @@ export function initSettings({ state }) {
     syncRuntimeModeBridgeState();
     reloadSettingsWithFeedback();
 
+    if (typeof setBeforePageLeave === 'function') {
+        setBeforePageLeave(({ from }) => {
+            if (from !== 'settings' || !settingsDirty) return true;
+            const leave = confirm('You have unsaved settings changes. Discard them and leave Settings?');
+            if (leave) discardUnsavedSettingsDraft();
+            return leave;
+        });
+    }
+
     byId('s-anthropic')?.addEventListener('input', () => {
         renderClaudeCodeUi();
         if (anthropicKeyConfigured()) {
@@ -443,6 +623,103 @@ export function initSettings({ state }) {
         if (event.target.closest('[data-effort-value], .secret-clear')) {
             queueMicrotask(updateSettingsDirtyState);
         }
+    });
+
+    function closeSettingsModelPickers(exceptPicker = null) {
+        page.querySelectorAll('[data-model-picker]').forEach((picker) => {
+            if (picker === exceptPicker) return;
+            const panel = picker.querySelector('.model-picker-results');
+            if (!panel) return;
+            panel.hidden = true;
+            panel.innerHTML = '';
+        });
+    }
+
+    function renderSettingsModelPicker(input) {
+        const picker = input.closest('[data-model-picker]');
+        const panel = picker?.querySelector('.model-picker-results');
+        if (!picker || !panel) return;
+        const needle = String(input.value || '').trim().toLowerCase();
+        let items = settingsModelCatalogItems
+            .filter((item) => {
+                const haystack = `${item.value} ${item.label || ''} ${item.provider || ''}`.toLowerCase();
+                return !needle || haystack.includes(needle);
+            })
+            .slice(0, 8);
+        if (!items.length && needle) {
+            items = settingsModelCatalogItems.slice(0, 8);
+        }
+        if (!items.length) {
+            panel.hidden = true;
+            panel.innerHTML = '';
+            return;
+        }
+        panel.innerHTML = items.map((item) => `
+            <button type="button" class="model-picker-item" data-value="${escapeHtml(item.value)}">
+                <span class="model-picker-item-value">${escapeHtml(item.value)}</span>
+                <span class="model-picker-item-label">${escapeHtml(item.label || item.provider || 'Catalog model')}</span>
+            </button>
+        `).join('');
+        panel.hidden = false;
+    }
+
+    page.addEventListener('focusin', (event) => {
+        const input = event.target instanceof Element
+            ? event.target.closest('[data-model-picker] input')
+            : null;
+        if (!input) return;
+        const picker = input.closest('[data-model-picker]');
+        closeSettingsModelPickers(picker);
+        renderSettingsModelPicker(input);
+    });
+    page.dataset.modelPickerBound = '1';
+
+    page.addEventListener('input', (event) => {
+        const input = event.target instanceof Element
+            ? event.target.closest('[data-model-picker] input')
+            : null;
+        if (!input) return;
+        const picker = input.closest('[data-model-picker]');
+        closeSettingsModelPickers(picker);
+        renderSettingsModelPicker(input);
+    });
+
+    page.addEventListener('mousedown', (event) => {
+        const item = event.target instanceof Element
+            ? event.target.closest('.model-picker-item')
+            : null;
+        if (item) {
+            const picker = item.closest('[data-model-picker]');
+            const input = picker?.querySelector('input');
+            if (input) {
+                event.preventDefault();
+                input.value = item.dataset.value || '';
+                closeSettingsModelPickers();
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            return;
+        }
+        if (!(event.target instanceof Element) || !event.target.closest('[data-model-picker]')) {
+            closeSettingsModelPickers();
+        }
+    });
+
+    document.addEventListener('settings-model-catalog:updated', (event) => {
+        const items = Array.isArray(event.detail?.items) ? event.detail.items : [];
+        settingsModelCatalogItems = items.length
+            ? items.map((item) => ({
+                value: item.value || item.id || '',
+                label: item.label || item.provider || 'Catalog model',
+                provider: item.provider || '',
+            })).filter((item) => item.value)
+            : SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Suggested model' }));
+        page.querySelectorAll('[data-model-picker]').forEach((picker) => {
+            const panel = picker.querySelector('.model-picker-results');
+            if (panel && !panel.hidden) {
+                const input = picker.querySelector('input');
+                renderSettingsModelPicker(input);
+            }
+        });
     });
 
     page.addEventListener('click', (event) => {
@@ -467,7 +744,7 @@ export function initSettings({ state }) {
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
             applyClaudeCodeStatus(data);
-            setStatus(data.repaired ? 'Claude runtime repaired.' : 'Claude runtime up to date.', 'ok');
+            setStatus(data.repaired ? 'Claude runtime repaired' : 'Claude runtime up to date', 'ok');
         } catch (error) {
             const message = String(error?.message || error || '');
             applyClaudeCodeStatus({
@@ -477,7 +754,7 @@ export function initSettings({ state }) {
                 error: message,
                 message: `Claude runtime repair failed: ${message}`,
             });
-            setStatus('Claude runtime repair failed.', 'warn');
+            setStatus('Claude runtime repair failed', 'warn');
         }
     });
 
@@ -515,16 +792,16 @@ export function initSettings({ state }) {
             let statusMsg;
             let statusType = 'ok';
             if (data.no_changes) {
-                statusMsg = 'No changes detected.';
+                statusMsg = 'No changes detected';
             } else if (data.restart_required) {
-                statusMsg = 'Settings saved. Some changes require a restart to take effect.';
+                statusMsg = 'Settings saved. Some changes require a restart to take effect';
                 statusType = 'warn';
             } else if (data.immediate_changed && data.next_task_changed) {
-                statusMsg = 'Settings saved. Some changes took effect immediately; others apply on the next task.';
+                statusMsg = 'Settings saved. Some changes took effect immediately; others apply on the next task';
             } else if (data.immediate_changed) {
-                statusMsg = 'Settings saved. Changes took effect immediately.';
+                statusMsg = 'Settings saved. Changes took effect immediately';
             } else {
-                statusMsg = 'Settings saved. Changes take effect on the next task.';
+                statusMsg = 'Settings saved. Changes take effect on the next task';
             }
             if (data.warnings && data.warnings.length) {
                 statusMsg += ' ⚠️ ' + data.warnings.join(' | ');
@@ -555,4 +832,9 @@ export function initSettings({ state }) {
             alert('Reset failed: ' + e.message);
         }
     });
+
+    return {
+        activateTab: activateSettingsTab,
+        page,
+    };
 }

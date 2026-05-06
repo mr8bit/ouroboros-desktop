@@ -8,11 +8,14 @@ auditability + later review.
 
 The adapter NEVER:
 
-- Forwards a setting key that overlaps with
+- Auto-forwards a setting key that overlaps with
   :data:`ouroboros.contracts.plugin_api.FORBIDDEN_SKILL_SETTINGS`.
-- Accepts a ``metadata.openclaw.install`` spec (brew/go/uv/node) — those
-  require global state mutations Ouroboros refuses to delegate to a
-  third-party package.
+  Core keys may be preserved in ``env_from_settings`` only as explicit
+  per-skill grant requirements; runtime access still requires fresh PASS
+  review plus owner approval bound to the current content hash.
+- Normalises ``metadata.openclaw.install`` specs into review-first
+  isolated dependency installs where possible; global host mutations
+  become manual guidance.
 - Trusts a declared ``always: true`` flag — every adapted skill lands
   with ``enabled: false`` and must be opted into by the operator
   through the Skills UI / ``toggle_skill`` after a PASS review.
@@ -41,6 +44,7 @@ from ouroboros.contracts.skill_manifest import (
     SkillManifestError,
     parse_skill_manifest_text,
 )
+from ouroboros.marketplace.install_specs import install_specs_hash, normalize_install_specs
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +52,7 @@ log = logging.getLogger(__name__)
 _ALLOWED_RUNTIME_BINS = frozenset({"python", "python3", "bash", "node"})
 _NAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 _MAX_SLUG_LEN = 64
+ADAPTER_VERSION = "5.5.0"
 
 
 @dataclass
@@ -152,6 +157,89 @@ def _extract_metadata_block(front: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(block, dict) and block:
             return block
     return {}
+
+
+def _json_safe(value: Any) -> Any:
+    """Return a JSON-serializable copy for provenance snapshots."""
+
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _openclaw_compat_snapshot(
+    front: Dict[str, Any],
+    metadata_block: Dict[str, Any],
+    warnings: List[str],
+) -> Dict[str, Any]:
+    """Preserve OpenClaw authoring metadata not native to Ouroboros."""
+
+    requires = metadata_block.get("requires") if isinstance(metadata_block, dict) else {}
+    if not isinstance(requires, dict):
+        requires = {}
+    unsupported_top_level = sorted(
+        key
+        for key in front.keys()
+        if key
+        not in {
+            "name",
+            "description",
+            "version",
+            "metadata",
+            "homepage",
+            "website",
+            "license",
+            "timeout_sec",
+            "when_to_use",
+        }
+    )
+    command_fields = {
+        key: front.get(key)
+        for key in (
+            "user-invocable",
+            "disable-model-invocation",
+            "command-dispatch",
+            "command-tool",
+            "command-arg-mode",
+            "argument-hint",
+            "arguments",
+        )
+        if key in front
+    }
+    if requires.get("config"):
+        warnings.append(
+            "OpenClaw metadata declares requires.config gates. Ouroboros "
+            "preserves them in provenance but does not treat them as runtime "
+            "permissions or auto-enable conditions."
+        )
+    if metadata_block.get("always") is True:
+        warnings.append(
+            "OpenClaw metadata declares always=true. Ouroboros ignores it: "
+            "marketplace installs still require review and explicit enablement."
+        )
+    return {
+        "adapter_version": ADAPTER_VERSION,
+        "metadata_openclaw": _json_safe(metadata_block),
+        "requires": {
+            "bins": _coerce_str_list(requires.get("bins")),
+            "anyBins": _coerce_str_list(requires.get("anyBins")),
+            "env": _coerce_str_list(requires.get("env")),
+            "config": _coerce_str_list(requires.get("config")),
+        },
+        "skill_key": str(metadata_block.get("skillKey") or "").strip(),
+        "emoji": str(metadata_block.get("emoji") or "").strip(),
+        "homepage": str(metadata_block.get("homepage") or front.get("homepage") or front.get("website") or "").strip(),
+        "primary_env": str(metadata_block.get("primaryEnv") or "").strip(),
+        "always": metadata_block.get("always") is True,
+        "command_fields": _json_safe(command_fields),
+        "unsupported_top_level_fields": unsupported_top_level,
+        "lossy_mappings": [
+            "metadata.openclaw.requires.* is load-time gating in OpenClaw; Ouroboros preserves it and only maps selected fields into permissions/env allowlists.",
+            "allowed-tools is advisory compatibility metadata; Ouroboros maps a conservative subset into permissions and keeps the original manifest in SKILL.openclaw.md.",
+            "metadata.openclaw.install is normalized into review-first isolated dependency installs when possible; global host mutations become manual setup guidance.",
+        ],
+    }
 
 
 def _coerce_str_list(value: Any) -> List[str]:
@@ -441,6 +529,25 @@ def _render_skill_md(translated_front: Dict[str, Any], body: str) -> str:
     return f"{_render_frontmatter(translated_front)}\n"
 
 
+def _append_manual_install_guidance(body: str, manual_specs: List[Dict[str, Any]]) -> str:
+    if not manual_specs:
+        return body
+    lines = [
+        "",
+        "## Manual setup required",
+        "",
+        "Ouroboros refused to run these publisher-declared installers automatically",
+        "because they cannot be confined to this skill's isolated dependency directory.",
+        "Install the required tools manually only if you trust the upstream project:",
+        "",
+    ]
+    for spec in manual_specs:
+        label = spec.get("package") or spec.get("kind") or "dependency"
+        reason = spec.get("reason") or "manual setup required"
+        lines.append(f"- `{label}`: {reason}")
+    return (body or "").rstrip() + "\n" + "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -475,12 +582,14 @@ def adapt_openclaw_skill(
     warnings: List[str] = []
     blockers: List[str] = []
     provenance: Dict[str, Any] = {
+        "schema_version": 1,
         "source": "clawhub",
         "slug": slug,
         "sanitized_name": sanitized,
         "version": (version or "").strip(),
         "sha256": (sha256 or "").strip(),
         "is_plugin": bool(is_plugin),
+        "adapter_version": ADAPTER_VERSION,
         "installed_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -514,20 +623,21 @@ def adapt_openclaw_skill(
         )
 
     metadata_block = _extract_metadata_block(original_front)
+    openclaw_compat = _openclaw_compat_snapshot(original_front, metadata_block, warnings)
 
-    install_specs = metadata_block.get("install") or []
-    if isinstance(install_specs, list) and install_specs:
-        kinds = sorted({
-            str(spec.get("kind") or "").strip()
-            for spec in install_specs
-            if isinstance(spec, dict) and spec.get("kind")
-        })
-        blockers.append(
-            "OpenClaw manifest declares install specs that require global "
-            "package-manager mutations (kinds=" + str(kinds) + "). Ouroboros "
-            "refuses to invoke brew/go/uv/node installers on the host; "
-            "ask the author for a self-contained skill or pre-install the "
-            "tooling manually before installing this skill."
+    raw_install_specs = metadata_block.get("install")
+    auto_install_specs, manual_install_specs, install_warnings = normalize_install_specs(raw_install_specs)
+    warnings.extend(install_warnings)
+    if auto_install_specs:
+        warnings.append(
+            "Skill declares dependency install specs. Ouroboros will land the "
+            "payload disabled, require a fresh PASS review, then install these "
+            "dependencies only inside the skill's .ouroboros_env directory."
+        )
+    if manual_install_specs:
+        warnings.append(
+            "Some install specs were converted to manual setup guidance because "
+            "they cannot be isolated without mutating global host state."
         )
 
     env_keys = _translate_env_from_settings(metadata_block, blockers, warnings)
@@ -584,6 +694,14 @@ def adapt_openclaw_skill(
         provenance_extras["license"] = license_field
     if primary_env:
         provenance_extras["primary_env"] = primary_env
+    if raw_install_specs not in (None, "", [], {}):
+        provenance_extras["install_specs"] = {
+            "schema_version": 1,
+            "auto": auto_install_specs,
+            "manual": manual_install_specs,
+            "raw": _json_safe(raw_install_specs),
+            "specs_hash": install_specs_hash(auto_install_specs),
+        }
     requested_grants = [
         key for key in env_keys
         if key.upper() in {item.upper() for item in FORBIDDEN_SKILL_SETTINGS}
@@ -625,7 +743,8 @@ def adapt_openclaw_skill(
         "schema_version": SKILL_MANIFEST_SCHEMA_VERSION,
     }
 
-    rendered_skill_md = _render_skill_md(translated_front, body)
+    rendered_body = _append_manual_install_guidance(body, manual_install_specs)
+    rendered_skill_md = _render_skill_md(translated_front, rendered_body)
     try:
         new_manifest = parse_skill_manifest_text(rendered_skill_md)
     except SkillManifestError as exc:
@@ -652,6 +771,8 @@ def adapt_openclaw_skill(
     provenance["original_manifest_sha256"] = _sha256_of_text(original_text)
     provenance["translated_manifest_sha256"] = _sha256_of_text(rendered_skill_md)
     provenance["adapter_warnings"] = list(warnings)
+    provenance["openclaw_compat"] = openclaw_compat
+    provenance["original_frontmatter"] = _json_safe(original_front)
     provenance.update(provenance_extras)
 
     if blockers:
@@ -724,6 +845,7 @@ def _sha256_of_text(text: str) -> str:
 
 
 __all__ = [
+    "ADAPTER_VERSION",
     "AdapterResult",
     "adapt_openclaw_skill",
     "sanitize_clawhub_slug",

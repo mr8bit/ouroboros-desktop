@@ -11,6 +11,7 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 from subprocess import Popen, CompletedProcess
 from typing import Any, Dict, List
@@ -157,6 +158,43 @@ _SHELL_INTERPRETERS = frozenset({
 })
 _ENV_REF_PATTERN = re.compile(r'\$(?:\{[A-Z][A-Z0-9_]*\}|[A-Z][A-Z0-9_]*)')
 
+# 2026-05-04: detect one bash/GNU grep alternation idiom that doesn't work
+# portably in argv mode. In bash, ``grep "A\|B"`` works on GNU grep because
+# basic-regex with `\|` as alternation is a GNU extension (and shell doesn't
+# expand the backslash inside double quotes). BSD grep on macOS treats ``\|``
+# as the literal two-character sequence, so the pattern matches nothing. Smaller
+# models that learned ``grep "A\|B"`` from bash scripts hit this when their
+# tool calls go to subprocess directly. Refuse with a teachable error
+# pointing at the correct argv form (``-E "A|B"`` or ``-e "A" -e "B"``).
+_GREP_TOOLS = frozenset(("grep", "egrep", "fgrep"))
+_GREP_REGEX_MODE_FLAGS = frozenset((
+    "-E", "--extended-regexp",
+    "-P", "--perl-regexp",
+    "-F", "--fixed-strings",
+    "-G", "--basic-regexp",
+))
+_GREP_BACKSLASH_PIPE_PATTERN = re.compile(r'\\\|')
+
+
+def _grep_has_explicit_regex_mode(cmd: List[str]) -> bool:
+    """Return True when grep argv explicitly chooses regex/string flavor."""
+    if not cmd:
+        return False
+    tool = pathlib.Path(cmd[0]).name.lower()
+    if tool in ("egrep", "fgrep"):
+        return True
+    for arg in cmd[1:]:
+        if not isinstance(arg, str):
+            continue
+        if arg in _GREP_REGEX_MODE_FLAGS:
+            return True
+        if arg.startswith("--"):
+            continue
+        # Short options may be clustered, e.g. `grep -rnE pattern path`.
+        if arg.startswith("-") and any(flag in arg[1:] for flag in ("E", "P", "F", "G")):
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # run_shell
@@ -182,7 +220,28 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "") -> str:
             except (ValueError, SyntaxError):
                 pass
         # 3. Shell-style string: "grep -rn pattern ."
+        #
+        # If the input STARTED with `[` or `{` and both structured-parse
+        # layers failed, it's a malformed JSON/Python literal — NOT a
+        # shell command. Refuse here rather than letting shlex.split strip
+        # the brackets and produce garbage argv that subprocess will fail
+        # to exec with a useless ENOENT (e.g. ``'[git,'``). 2026-05-03
+        # production bug.
         if recovered is None:
+            stripped = cmd.lstrip()
+            is_posix_test_cmd = stripped.startswith("[ ") and stripped.rstrip().endswith(" ]")
+            if stripped[:1] in ("[", "{") and not is_posix_test_cmd:
+                return (
+                    '⚠️ SHELL_ARG_ERROR: `cmd` looks like a JSON/Python list literal '
+                    'but failed to parse cleanly (likely an escape or quote-mismatch '
+                    'issue). Pass cmd as an actual array, not a stringified array.\n\n'
+                    'Correct usage:\n'
+                    '  run_shell(cmd=["git", "log", "--oneline", "-10"])\n\n'
+                    'Wrong usage (the failure that brought you here):\n'
+                    '  run_shell(cmd=\'["git", "log", "--oneline", "-10"]\')\n\n'
+                    'For reading files, prefer `repo_read` / `data_read`.\n'
+                    'For searching code, prefer `code_search`.'
+                )
             try:
                 parts = shlex.split(cmd)
                 if parts:
@@ -232,6 +291,29 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "") -> str:
             'be executed directly via subprocess. '
             'Use ["sh", "-c", "your command"] if you need shell builtins.'
         )
+
+    # 2026-05-04: detect bash/GNU grep `\|` alternation in argv when it
+    # has not explicitly selected a regex flavor (see comment above).
+    # Only fires when the user hasn't explicitly chosen a regex flavor —
+    # if they passed -E / -G / -P / -F they know what they're asking for.
+    if cmd and pathlib.Path(cmd[0]).name.lower() in _GREP_TOOLS:
+        if not _grep_has_explicit_regex_mode(cmd):
+            for arg in cmd[1:]:
+                if isinstance(arg, str) and _GREP_BACKSLASH_PIPE_PATTERN.search(arg):
+                    return (
+                        f'⚠️ SHELL_REGEX_HINT: argv contains backslash-escaped '
+                        f'grep alternation (\\|) in arg {arg!r}. '
+                        'GNU grep accepts \\| as a basic-regex extension, '
+                        'but BSD grep on macOS treats it as the literal '
+                        'two-character sequence unless a compatible mode is '
+                        'selected. Fixes:\n'
+                        '  - Extended regex (no escaping): grep -E "A|B" file\n'
+                        '  - Multiple patterns: grep -e "A" -e "B" file\n'
+                        '  - Force basic regex with GNU-style alternation: '
+                        'grep -G "A\\|B" file (only works on GNU grep, not BSD)\n'
+                        '  - Or use code_search for symbolic lookups inside '
+                        'the repo.'
+                    )
 
     # Reject shell operators in cmd array (subprocess doesn't interpret them)
     found_ops = _SHELL_OPERATORS.intersection(cmd)
@@ -339,9 +421,10 @@ def _get_diff_stat(repo_dir: pathlib.Path) -> str:
 
 def _run_validation(repo_dir: pathlib.Path) -> str:
     """Run basic validation after edit (tests). Returns summary."""
+    agent_python = sys.executable or os.environ.get("OUROBOROS_AGENT_PYTHON") or "python3"
     try:
         res = subprocess.run(
-            ["python", "-m", "pytest", "tests/", "--tb=line", "-q"],
+            [agent_python, "-m", "pytest", "tests/", "--tb=line", "-q"],
             cwd=str(repo_dir), capture_output=True, text=True, timeout=60,
         )
         if res.returncode == 0:
@@ -473,10 +556,31 @@ def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("run_shell", {
             "name": "run_shell",
-            "description": "Run a shell command (list of args) inside the repo. Returns stdout+stderr.",
+            "description": (
+                "Run a command inside the repo. Returns stdout+stderr. "
+                "cmd MUST be an array of strings, never a single shell-style "
+                "string. Use cwd= for working directory; cd is rejected. "
+                "For pipes/chaining use [\"sh\", \"-c\", \"cmd1 && cmd2\"]."
+            ),
             "parameters": {"type": "object", "properties": {
-                "cmd": {"type": "array", "items": {"type": "string"}},
-                "cwd": {"type": "string", "default": ""},
+                "cmd": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Argv as a JSON array of strings. Example: "
+                        "[\"git\", \"log\", \"--oneline\", \"-10\"]. NEVER "
+                        "pass a single string like \"git log\" or a "
+                        "stringified array like '[\"git\", \"log\"]'."
+                    ),
+                },
+                "cwd": {
+                    "type": "string", "default": "",
+                    "description": (
+                        "Working directory relative to the repo root. Use "
+                        "this instead of `cd` (which is a shell builtin "
+                        "and is rejected)."
+                    ),
+                },
             }, "required": ["cmd"]},
         }, _run_shell, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC),
         ToolEntry("claude_code_edit", {

@@ -7,12 +7,14 @@ trivial python3 script. No network, no real LLM calls — the
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
 import shutil
 import sys
 import tempfile
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -108,16 +110,113 @@ def _mark_reviewed_and_enabled(drive_root: pathlib.Path, skill_dir: pathlib.Path
     )
 
 
+def _mark_reviewed(drive_root: pathlib.Path, skill_dir: pathlib.Path, name: str):
+    save_review_state(
+        drive_root,
+        name,
+        SkillReviewState(status="pass", content_hash=compute_content_hash(skill_dir)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tool registration
 # ---------------------------------------------------------------------------
 
 
 def test_skill_exec_tools_register_in_registry(tmp_path):
-    """ToolRegistry must expose all four Phase 3 skill tools."""
+    """ToolRegistry must expose the skill lifecycle tools."""
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     names = {t["function"]["name"] for t in registry.schemas()}
-    assert {"list_skills", "review_skill", "skill_exec", "toggle_skill"} <= names
+    assert {"list_skills", "review_skill", "skill_exec", "toggle_skill", "skill_preflight"} <= names
+
+
+def test_review_skill_uses_long_timeout_separate_from_skill_exec():
+    entries = {entry.name: entry for entry in skill_exec_mod.get_tools()}
+
+    assert entries["skill_exec"].timeout_sec == skill_exec_mod._HARD_TIMEOUT_CEILING_SEC
+    assert entries["review_skill"].timeout_sec >= 1800
+    assert entries["review_skill"].timeout_sec > entries["skill_exec"].timeout_sec
+
+
+def test_skill_preflight_success_and_no_pycache(tmp_path, monkeypatch):
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    skill_dir = _build_skill(skills_root, "alpha", script_body="print('ok')\n")
+
+    from ouroboros.tools.skill_preflight import _handle_skill_preflight
+
+    result = json.loads(_handle_skill_preflight(ctx, skill="alpha"))
+
+    assert result["ok"] is True
+    assert result["files_checked"] >= 1
+    assert result["files_failed"] == 0
+    assert not (skill_dir / "scripts" / "__pycache__").exists()
+
+
+def test_skill_preflight_reports_python_syntax_error(tmp_path, monkeypatch):
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _build_skill(skills_root, "alpha", script_body="def broken(:\n")
+
+    from ouroboros.tools.skill_preflight import _handle_skill_preflight
+
+    result = json.loads(_handle_skill_preflight(ctx, skill="alpha"))
+
+    assert result["ok"] is False
+    assert result["files_failed"] == 1
+    assert "SyntaxError" in result["files"][0]["stderr"]
+
+
+def test_skill_preflight_fails_closed_when_file_limit_omits_payload(tmp_path, monkeypatch):
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    skill_dir = _build_skill(skills_root, "alpha")
+    scripts = skill_dir / "scripts"
+    from ouroboros.tools import skill_preflight as sp
+
+    for idx in range(sp._PREFLIGHT_HARD_FILE_LIMIT + 2):
+        (scripts / f"extra_{idx}.py").write_text("print('ok')\n", encoding="utf-8")
+
+    result = json.loads(sp._handle_skill_preflight(ctx, skill="alpha"))
+
+    assert result["ok"] is False
+    assert result["omitted_count"] > 0
+
+
+def test_skill_preflight_missing_validator_runtime_is_not_ok(tmp_path, monkeypatch):
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    skill_dir = _build_skill(skills_root, "alpha")
+    (skill_dir / "scripts" / "check.js").write_text("console.log('ok')\n", encoding="utf-8")
+
+    from ouroboros.tools import skill_preflight as sp
+    monkeypatch.setattr(sp, "_resolve_runtime", lambda runtime: None if runtime == "node" else "/bin/echo")
+
+    result = json.loads(sp._handle_skill_preflight(ctx, skill="alpha", paths=["scripts/check.js"]))
+
+    assert result["ok"] is False
+    assert result["files"][0]["skipped"] is True
+
+
+def test_run_shell_script_scan_handles_interpreter_option_values(tmp_path):
+    """Regression for v5.7.0 A2 review: python/node options that consume a
+    following value must not hide the actual script file from run_shell's
+    content scanner."""
+    from ouroboros.tools.registry import _extract_script_file_args
+
+    assert _extract_script_file_args(["python3", "-W", "ignore", "evil.py"]) == ["evil.py"]
+    assert _extract_script_file_args(["python3", "-X", "utf8", "evil.py"]) == ["evil.py"]
+    assert _extract_script_file_args(["node", "--require", "preload.js", "evil.js"]) == ["preload.js", "evil.js"]
+    assert _extract_script_file_args(["node", "--require=preload.js", "-e", "console.log(1)"]) == ["preload.js"]
+    assert _extract_script_file_args(["node", "--import=preload.mjs", "evil.js"]) == ["preload.mjs", "evil.js"]
 
 
 def test_skill_exec_tools_have_policy_entries():
@@ -127,6 +226,7 @@ def test_skill_exec_tools_have_policy_entries():
     assert TOOL_POLICY["list_skills"] == POLICY_SKIP
     assert TOOL_POLICY["review_skill"] == POLICY_SKIP
     assert TOOL_POLICY["toggle_skill"] == POLICY_SKIP
+    assert TOOL_POLICY["skill_preflight"] == POLICY_SKIP
     assert TOOL_POLICY["skill_exec"] == POLICY_CHECK
 
 
@@ -451,9 +551,10 @@ def test_skill_exec_runs_in_light_mode(tmp_path, monkeypatch):
 
 def test_toggle_skill_persists_enable_state(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
-    _build_skill(skills_root, "alpha")
+    skill_dir = _build_skill(skills_root, "alpha")
     ctx = _make_ctx(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _mark_reviewed(ctx.drive_root, skill_dir, "alpha")
 
     # Enable, then disable.
     enabled_resp = json.loads(skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True))
@@ -462,6 +563,335 @@ def test_toggle_skill_persists_enable_state(tmp_path, monkeypatch):
 
     disabled_resp = json.loads(skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=False))
     assert disabled_resp["enabled"] is False
+
+
+def test_toggle_skill_blocked_in_heal_context(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    skill_dir = _build_skill(skills_root, "alpha")
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/external/alpha"\nrepair alpha'}]
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _mark_reviewed(ctx.drive_root, skill_dir, "alpha")
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("toggle_skill", {"skill": "alpha", "enabled": True})
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+@pytest.mark.parametrize("tool_name,args", [
+    ("run_shell", {"cmd": ["python", "-c", "print('x')"]}),
+    ("browse_page", {"url": "http://127.0.0.1"}),
+    ("browser_action", {"action": "evaluate", "value": "fetch('/api/skills/x/toggle')"}),
+    ("schedule_task", {"text": "enable skill"}),
+    ("skill_exec", {"skill": "alpha", "script": "hello.py"}),
+    ("repo_write", {"path": "x.txt", "content": "x"}),
+    ("str_replace_editor", {"path": "x.txt", "old": "a", "new": "b"}),
+    ("claude_code_edit", {"prompt": "edit repo"}),
+])
+def test_heal_context_blocks_indirect_enable_paths(tool_name, args, tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/external/alpha"\nrepair alpha'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute(tool_name, args)
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+def test_heal_context_allows_payload_tools_and_review(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/external/alpha"\nrepair alpha'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_write", {"path": "skills/external/alpha/notes.txt", "content": "x"})
+
+    assert "HEAL_MODE_BLOCKED" not in result
+    assert "OK" in result
+
+
+def test_heal_context_allows_ouroboroshub_payload_tools(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="nanobanana"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/ouroboroshub/nanobanana"\nrepair nanobanana'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_write", {"path": "skills/ouroboroshub/nanobanana/plugin.py", "content": "# fixed"})
+
+    assert "HEAL_MODE_BLOCKED" not in result
+    assert "OK" in result
+
+
+@pytest.mark.parametrize("sidecar", [".ouroboroshub.json", ".clawhub.json"])
+def test_heal_context_blocks_marketplace_sidecar_writes(sidecar, tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="nanobanana"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/ouroboroshub/nanobanana"\nrepair nanobanana'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_write", {"path": f"skills/ouroboroshub/nanobanana/{sidecar}", "content": "{}"})
+
+    assert "HEAL_MODE_BLOCKED" in result
+    assert "provenance sidecars" in result
+
+
+@pytest.mark.parametrize("tool_name,args", [
+    ("data_write", {"path": "memory/identity.md", "content": "x"}),
+    ("data_read", {"path": "settings.json"}),
+    ("data_list", {"dir": "memory"}),
+    ("review_skill", {"skill": "beta"}),
+    ("skill_preflight", {"skill": "beta"}),
+])
+def test_heal_context_blocks_out_of_scope_data_access(tool_name, args, tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/external/alpha"\nrepair alpha'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute(tool_name, args)
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+def test_heal_context_blocks_symlink_escape_from_selected_skill(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/external/alpha"\nrepair alpha'}]
+    skill_root = pathlib.Path(ctx.drive_root) / "skills" / "external" / "alpha"
+    memory_root = pathlib.Path(ctx.drive_root) / "memory"
+    skill_root.mkdir(parents=True)
+    memory_root.mkdir()
+    (memory_root / "identity.md").write_text("secret-ish", encoding="utf-8")
+    try:
+        (skill_root / "escape").symlink_to(memory_root / "identity.md")
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks unavailable on this filesystem")
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_read", {"path": "skills/external/alpha/escape"})
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+def test_heal_context_blocks_wrong_source_root(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/clawhub/alpha"\nrepair alpha'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_write", {"path": "skills/external/alpha/notes.txt", "content": "x"})
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+def test_heal_context_blocks_native_payload_root_marker(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/native/alpha"\nrepair alpha'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_read", {"path": "skills/native/alpha/SKILL.md"})
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+def test_heal_context_rejects_traversal_skill_marker(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="../.."\nHEAL_SKILL_PAYLOAD_ROOT_JSON="../../"\nrepair'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_read", {"path": "settings.json"})
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+def test_heal_context_rejects_traversal_payload_root_marker(tmp_path):
+    ctx = _make_ctx(tmp_path)
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/external/alpha/../../memory"\nrepair'}]
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    registry._ctx = ctx
+
+    result = registry.execute("data_read", {"path": "memory/identity.md"})
+
+    assert "HEAL_MODE_BLOCKED" in result
+
+
+def test_heal_review_does_not_reconcile_live_extension(tmp_path, monkeypatch):
+    import types
+
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    ctx.messages = [{"role": "user", "content": 'HEAL_MODE_NO_ENABLE\nHEAL_SKILL_NAME_JSON="alpha"\nHEAL_SKILL_PAYLOAD_ROOT_JSON="skills/external/alpha"\nrepair alpha'}]
+    calls = []
+
+    monkeypatch.setattr(
+        skill_exec_mod,
+        "_review_skill_impl",
+        lambda _ctx, skill_name: types.SimpleNamespace(
+            skill_name=skill_name,
+            status="pass",
+            content_hash="hash",
+            reviewer_models=[],
+            findings=[],
+            error="",
+        ),
+    )
+
+    from ouroboros import extension_loader
+    monkeypatch.setattr(extension_loader, "reconcile_extension", lambda *a, **kw: calls.append(a) or {"action": "extension_loaded"})
+
+    result = json.loads(skill_exec_mod._handle_review_skill(ctx, skill="alpha"))
+
+    assert calls == []
+    assert result["extension_reason"] == "heal_review_only"
+
+
+def test_review_skill_tool_records_lifecycle_job_state_and_events(tmp_path, monkeypatch):
+    from ouroboros.skill_review import SkillReviewOutcome
+    import ouroboros.skill_lifecycle_queue as lifecycle_queue
+
+    lifecycle_queue._events.clear()
+    lifecycle_queue._active = None
+    lifecycle_queue._lock = None
+    lifecycle_queue._dedupe_jobs.clear()
+
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    skill_dir = _build_skill(skills_root, "alpha")
+    content_hash = compute_content_hash(skill_dir)
+
+    monkeypatch.setattr(
+        skill_exec_mod,
+        "_review_skill_impl",
+        lambda _ctx, skill_name: SkillReviewOutcome(
+            skill_name=skill_name,
+            status="pass",
+            content_hash=content_hash,
+            reviewer_models=["fake/reviewer"],
+            findings=[],
+            error="",
+        ),
+    )
+
+    result = json.loads(skill_exec_mod._handle_review_skill(ctx, skill="alpha"))
+
+    assert result["status"] == "pass"
+    assert result["deps_status"] == "not_required"
+    review_job = json.loads(
+        (ctx.drive_root / "state" / "skills" / "alpha" / "review_job.json").read_text(encoding="utf-8")
+    )
+    assert review_job["status"] == "completed"
+    assert review_job["review_status"] == "pass"
+    assert review_job["job_id"].startswith("skill-job-")
+    lifecycle_event = lifecycle_queue.queue_snapshot()["events"][-1]
+    assert lifecycle_event["kind"] == "review"
+    assert lifecycle_event["target"] == "alpha"
+    events_text = (ctx.drive_root / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    assert "skill_review_started" in events_text
+    assert "skill_review_completed" in events_text
+
+
+def test_stale_review_job_is_marked_interrupted(tmp_path, monkeypatch):
+    from ouroboros.skill_review_runner import (
+        mark_stale_review_job_interrupted,
+        review_job_state_path,
+    )
+
+    ctx = _make_ctx(tmp_path)
+    job_path = review_job_state_path(ctx.drive_root, "alpha")
+    job_path.write_text(
+        json.dumps(
+            {
+                "status": "running",
+                "skill": "alpha",
+                "content_hash": "abc",
+                "job_id": "skill-job-old",
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "last_heartbeat_at": "2026-01-01T00:00:00+00:00",
+                "pid": 123456,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("ouroboros.skill_review_runner._pid_alive", lambda _pid: False)
+
+    mark_stale_review_job_interrupted(ctx.drive_root, "alpha", current_content_hash="abc")
+
+    data = json.loads(job_path.read_text(encoding="utf-8"))
+    assert data["status"] == "interrupted"
+    assert data["interrupt_reason"] == "owner_process_exited"
+    events_text = (ctx.drive_root / "logs" / "events.jsonl").read_text(encoding="utf-8")
+    assert "skill_review_interrupted" in events_text
+
+
+def test_async_review_cancellation_waits_for_review_thread(tmp_path, monkeypatch):
+    from ouroboros.skill_review import SkillReviewOutcome
+    from ouroboros.skill_review_runner import run_skill_review_lifecycle
+    import ouroboros.skill_lifecycle_queue as lifecycle_queue
+
+    lifecycle_queue._events.clear()
+    lifecycle_queue._active = None
+    lifecycle_queue._lock = None
+    lifecycle_queue._dedupe_jobs.clear()
+
+    ctx = _make_ctx(tmp_path)
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    skill_dir = _build_skill(skills_root, "alpha")
+    content_hash = compute_content_hash(skill_dir)
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_review(_ctx, skill_name):
+        started.set()
+        release.wait(2)
+        return SkillReviewOutcome(
+            skill_name=skill_name,
+            status="pass",
+            content_hash=content_hash,
+            reviewer_models=["fake/reviewer"],
+            findings=[],
+            error="",
+        )
+
+    async def main():
+        task = asyncio.create_task(
+            run_skill_review_lifecycle(ctx, "alpha", source="test", review_impl=fake_review)
+        )
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        active = lifecycle_queue.queue_snapshot()["active"]
+        assert active is not None
+        assert active["target"] == "alpha"
+        quick = asyncio.create_task(
+            lifecycle_queue.run_lifecycle_job(
+                kind="review",
+                target="beta",
+                dedupe_key="review:beta:hash",
+                runner=lambda: asyncio.sleep(0, result={"quick": True}),
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not quick.done()
+        release.set()
+        result = await asyncio.wait_for(task, timeout=2)
+        assert result["status"] == "pass"
+        assert await asyncio.wait_for(quick, timeout=2) == {"quick": True}
+        assert lifecycle_queue.queue_snapshot()["active"] is None
+
+    asyncio.run(main())
 
 
 def test_toggle_skill_requires_both_args(tmp_path, monkeypatch):
@@ -478,9 +908,10 @@ def test_toggle_skill_rejects_ambiguous_non_boolean(tmp_path, monkeypatch):
     rather than silently enabling when the caller meant to disable."""
     import json as _json
     skills_root = tmp_path / "skills"
-    _build_skill(skills_root, "alpha")
+    skill_dir = _build_skill(skills_root, "alpha")
     ctx = _make_ctx(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    _mark_reviewed(ctx.drive_root, skill_dir, "alpha")
 
     # These look booleans-ish but could flip enabled incorrectly under
     # naive ``bool()`` coercion. The handler must accept them ONLY
@@ -497,7 +928,7 @@ def test_toggle_skill_rejects_ambiguous_non_boolean(tmp_path, monkeypatch):
         assert "SKILL_TOGGLE_ERROR" in resp, f"bogus={bogus!r} was accepted: {resp}"
 
 
-def test_toggle_skill_mentions_stale_pass_review(tmp_path, monkeypatch):
+def test_toggle_skill_rejects_stale_pass_review(tmp_path, monkeypatch):
     skills_root = tmp_path / "skills"
     _build_skill(skills_root, "alpha")
     ctx = _make_ctx(tmp_path)
@@ -508,9 +939,9 @@ def test_toggle_skill_mentions_stale_pass_review(tmp_path, monkeypatch):
         SkillReviewState(status="pass", content_hash="OLD_HASH"),
     )
 
-    resp = json.loads(skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True))
-    assert resp["enabled"] is True
-    assert "stale PASS verdict" in resp["message"]
+    resp = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
+    assert "SKILL_TOGGLE_ERROR" in resp
+    assert "fresh PASS" in resp
 
 
 def test_skill_exec_rejects_misserialized_args(tmp_path, monkeypatch):
@@ -847,7 +1278,7 @@ def test_skill_exec_returns_controlled_error_when_payload_becomes_unreadable(
 
 def test_runtime_allowlist_covers_phase3_runtimes():
     allowed = set(skill_exec_mod._ALLOWED_RUNTIMES)
-    assert {"python", "python3", "bash", "node"} <= allowed
+    assert {"python", "python3", "bash", "node", "deno", "ruby", "go"} <= allowed
 
 
 def test_python3_runtime_falls_back_to_python_for_windows():

@@ -46,6 +46,18 @@ def is_container_env() -> bool:
     return False
 
 
+def open_path_external(path: pathlib.Path) -> None:
+    """Open a local path with the platform default application."""
+
+    target = pathlib.Path(path)
+    if IS_MACOS:
+        subprocess.Popen(["open", str(target)])
+    elif IS_WINDOWS:
+        os.startfile(str(target))  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", str(target)])
+
+
 def _hidden_run(command: list[str], **kwargs):
     if _SUBPROCESS_NO_WINDOW:
         kwargs = dict(kwargs)
@@ -60,19 +72,33 @@ _lock_fd: Any = None
 
 
 def pid_lock_acquire(path: str) -> bool:
-    """Acquire an exclusive PID lock. Returns True on success."""
+    """Acquire an exclusive PID lock. Returns True on success.
+
+    The previous form opened the file before attempting the lock, then on
+    lock-failure returned False with the file still open — slowly leaking
+    file descriptors under repeated failed startup attempts. Close the
+    file explicitly on lock-acquire failure so the FD count stays bounded.
+    """
     global _lock_fd
+    fd_obj = None
     try:
-        _lock_fd = open(path, "w")
+        fd_obj = open(path, "w")
         if IS_WINDOWS:
-            _win32_lock(_lock_fd.fileno(), exclusive=True, blocking=False)
+            _win32_lock(fd_obj.fileno(), exclusive=True, blocking=False)
         else:
             import fcntl
-            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _lock_fd.write(str(os.getpid()))
-        _lock_fd.flush()
+            fcntl.flock(fd_obj, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd_obj.write(str(os.getpid()))
+        fd_obj.flush()
+        # Promote to global only after lock + write both succeeded.
+        _lock_fd = fd_obj
         return True
     except (IOError, OSError):
+        if fd_obj is not None:
+            try:
+                fd_obj.close()
+            except Exception:
+                pass
         return False
 
 
@@ -140,6 +166,18 @@ def file_unlock(fd: int) -> None:
     else:
         import fcntl
         fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def pid_is_alive(pid: int) -> bool:
+    """Return whether a PID appears alive without exposing os.kill to callers."""
+
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -95,17 +95,18 @@ def test_tool_set_matches(registry):
 
 EXPECTED_TOOLS = [
     "repo_read", "repo_write", "repo_write_commit", "repo_list", "repo_commit", "str_replace_editor",
+    "read_file", "write_file", "edit",
     "data_read", "data_write", "data_list",
     "git_status", "git_diff",
     "pull_from_remote", "restore_to_head", "revert_commit", "rollback_to_target",
-    "run_shell", "claude_code_edit",
-    "browse_page", "browser_action",
+    "run_shell", "exec", "bash", "shell", "run_command", "claude_code_edit",
+    "browse_page", "web_fetch", "fetch", "browser_action",
     "web_search",
     "chat_history", "update_scratchpad", "update_identity",
     "set_tool_timeout", "request_restart", "promote_to_stable", "request_deep_self_review",
     "schedule_task", "cancel_task",
     "switch_model", "toggle_evolution", "toggle_consciousness",
-    "send_user_message", "send_photo",
+    "send_user_message", "message", "message_user", "notify_user", "send_photo",
     "codebase_digest", "codebase_health",
     "knowledge_read", "knowledge_write", "knowledge_list",
     # Memory registry
@@ -142,8 +143,13 @@ EXPECTED_TOOLS = [
     # A2A (Agent-to-Agent protocol, non-core: require enable_tools)
     "a2a_discover", "a2a_send", "a2a_status",
     # Phase 3 three-layer refactor: external skill surface
-    # (non-core: require enable_tools)
+    # (non-core: require enable_tools, except review_skill which is core
+    # in v5.7.0+ so heal mode can satisfy its own prompt without a
+    # forbidden enable_tools round-trip)
     "list_skills", "review_skill", "skill_exec", "toggle_skill",
+    # v5.7.0: skill_preflight — heal-allowed validator that runs
+    # Python compile() / node --check / bash -n on a skill's payload.
+    "skill_preflight",
 ]
 
 
@@ -492,7 +498,7 @@ def test_function_count_reasonable():
     """Codebase doesn't have too few or too many functions.
 
     The hard gate value is imported from ouroboros/review.py::MAX_TOTAL_FUNCTIONS
-    (currently 1160 as of v4.32.0) — no hardcoded number here.
+    (currently 2000 as of v5.7.4) — no hardcoded assertion number here.
     """
     from ouroboros.review import MAX_TOTAL_FUNCTIONS
 

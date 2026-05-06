@@ -59,6 +59,10 @@ DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 PORT_FILE = DATA_DIR / "state" / "server_port"
 
 sys.path.insert(0, str(REPO_DIR))
+if not os.environ.get("OUROBOROS_AGENT_PYTHON"):
+    _agent_python = sys.executable
+    if isinstance(_agent_python, str) and _agent_python:
+        os.environ["OUROBOROS_AGENT_PYTHON"] = _agent_python
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -123,7 +127,7 @@ from ouroboros.platform_layer import is_container_env
 
 def _build_network_meta(bind_host: str, bind_port: int) -> dict:
     """Build the _meta dict for /api/settings response."""
-    from ouroboros.server_auth import is_loopback_host
+    from ouroboros.server_auth import get_network_auth_startup_warning, is_loopback_host
     # Strip surrounding brackets from IPv6 literals (e.g. "[::1]" → "::1") so
     # is_loopback_host can correctly classify bracketed IPv6 loopback addresses.
     unbracketed = bind_host[1:-1] if bind_host.startswith("[") and bind_host.endswith("]") else bind_host
@@ -154,16 +158,23 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
         # Use unbracketed form so URL construction can uniformly re-bracket IPv6.
         lan_ip = unbracketed
 
+    auth_warning = get_network_auth_startup_warning(bind_host) or ""
     if lan_ip:
         # Handle IPv6 addresses (bracket them for URL)
         host_in_url = f"[{lan_ip}]" if ":" in lan_ip else lan_ip
         reachability = "lan_reachable"
         recommended_url = f"http://{host_in_url}:{bind_port}"
-        warning = ""
+        warning = auth_warning
     else:
         reachability = "host_ip_unknown"
         recommended_url = f"http://your-host-ip:{bind_port}"
-        warning = "Could not detect LAN IP automatically." if wildcard else ""
+        warning = " ".join(
+            part for part in [
+                "Could not detect LAN IP automatically." if wildcard else "",
+                auth_warning,
+            ]
+            if part
+        )
     return {
         "bind_host": bind_host,
         "bind_port": bind_port,
@@ -184,16 +195,28 @@ def _has_ws_clients() -> bool:
         return bool(_ws_clients)
 
 async def broadcast_ws(msg: dict) -> None:
-    """Send a message to all connected WebSocket clients."""
+    """Send a message to all connected WebSocket clients.
+
+    Send-failures are surfaced at INFO with the message type so silent UI
+    desync is visible in the server log; a structured
+    ``broadcast_partial_failure`` event is emitted to events.jsonl when at
+    least one client failed, so the signal also lands in the events stream
+    that operators tail.
+    """
     data = json.dumps(msg, ensure_ascii=False, default=str)
+    msg_type = str(msg.get("type", "unknown"))
     with _ws_lock:
         clients = list(_ws_clients)
+        total_clients = len(clients)
     dead = []
     for ws in clients:
         try:
             await ws.send_text(data)
-        except Exception:
-            log.debug("Dropping dead WebSocket client during broadcast", exc_info=True)
+        except Exception as exc:
+            log.info(
+                "WebSocket send failed for msg type=%s; dropping client (%s)",
+                msg_type, type(exc).__name__,
+            )
             dead.append(ws)
     if dead:
         with _ws_lock:
@@ -202,6 +225,20 @@ async def broadcast_ws(msg: dict) -> None:
                     _ws_clients.remove(ws)
                 except ValueError:
                     pass
+        try:
+            from ouroboros.utils import utc_now_iso, append_jsonl
+            append_jsonl(
+                DATA_DIR / "logs" / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "broadcast_partial_failure",
+                    "msg_type": msg_type,
+                    "dead_clients": len(dead),
+                    "total_clients": total_clients,
+                },
+            )
+        except Exception:
+            log.debug("Failed to emit broadcast_partial_failure event", exc_info=True)
 
 
 def broadcast_ws_sync(msg: dict) -> None:
@@ -247,6 +284,7 @@ _IMMEDIATE_KEYS = frozenset({
 # Everything else is hot-reloadable (takes effect on the next task).
 _RESTART_REQUIRED_KEYS = frozenset({
     "OUROBOROS_MAX_WORKERS",
+    "OUROBOROS_SERVER_HOST",
     "LOCAL_MODEL_SOURCE",
     "LOCAL_MODEL_FILENAME",
     "LOCAL_MODEL_PORT",
@@ -464,6 +502,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
         image_base64 = str(msg.get("image_base64") or "")
         image_mime = str(msg.get("image_mime") or "image/jpeg")
         image_caption = str(msg.get("image_caption") or "")
+        suppress_chat_log = bool(msg.get("suppress_chat_log"))
         image_data = (
             (image_base64, image_mime, image_caption)
             if image_base64
@@ -479,17 +518,18 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
 
         from supervisor.message_bus import log_chat
 
-        log_chat(
-            "in",
-            chat_id,
-            user_id,
-            log_text,
-            source=source,
-            sender_label=sender_label,
-            sender_session_id=sender_session_id,
-            client_message_id=client_message_id,
-            telegram_chat_id=telegram_chat_id,
-        )
+        if not suppress_chat_log:
+            log_chat(
+                "in",
+                chat_id,
+                user_id,
+                log_text,
+                source=source,
+                sender_label=sender_label,
+                sender_session_id=sender_session_id,
+                client_message_id=client_message_id,
+                telegram_chat_id=telegram_chat_id,
+            )
         st["last_owner_message_at"] = now_iso
         ctx.save_state(st)
 
@@ -1191,6 +1231,58 @@ async def api_settings_post(request: Request) -> JSONResponse:
         current["OUROBOROS_SKILLS_REPO_PATH"] = str(
             current.get("OUROBOROS_SKILLS_REPO_PATH") or ""
         ).strip()
+        try:
+            from ouroboros.server_auth import is_loopback_host
+            desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
+            desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
+            allowed_saved_hosts = {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0", "::", "[::]"}
+            if desired_host and desired_host not in allowed_saved_hosts:
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Server Bind Host in Settings supports localhost or wildcard "
+                            "binds only (127.0.0.1 or 0.0.0.0). Specific LAN IP binds "
+                            "are manual/env-only so the desktop launcher can keep using "
+                            "a reliable loopback health check."
+                        )
+                    },
+                    status_code=400,
+                )
+            if desired_host and not is_loopback_host(desired_host) and not desired_password:
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Setting a non-localhost Server Bind Host through the web UI "
+                            "requires a Network Password in the same save. For manual "
+                            "trusted-lab/Docker setups, stop Ouroboros and edit "
+                            "settings.json or environment variables directly."
+                        )
+                    },
+                    status_code=400,
+                )
+            current_effective_host = (
+                str(_BIND_HOST or "").strip()
+                or str(os.environ.get("OUROBOROS_SERVER_HOST") or "").strip()
+            )
+            old_password = str(old_settings.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
+            if (
+                current_effective_host
+                and not is_loopback_host(current_effective_host)
+                and old_password
+                and not desired_password
+            ):
+                return JSONResponse(
+                    {
+                        "error": (
+                            "Cannot clear Network Password while the running server is "
+                            "still bound to a non-localhost interface. First save a "
+                            "loopback Server Bind Host and restart, then clear the password."
+                        )
+                    },
+                    status_code=400,
+                )
+        except Exception:
+            log.warning("Could not validate network bind settings", exc_info=True)
         current, provider_defaults_changed, provider_default_keys = apply_runtime_provider_defaults(current)
         if str(current.get("LOCAL_MODEL_SOURCE", "") or "").strip() and not has_supervisor_provider(current):
             return JSONResponse(
@@ -1267,6 +1359,17 @@ async def api_settings_post(request: Request) -> JSONResponse:
             get_bridge().configure_from_settings(current)
         except Exception:
             pass
+        try:
+            from ouroboros.server_auth import is_loopback_host
+            desired_host = str(current.get("OUROBOROS_SERVER_HOST") or "").strip()
+            desired_password = str(current.get("OUROBOROS_NETWORK_PASSWORD") or "").strip()
+            if desired_host and not is_loopback_host(desired_host) and not desired_password:
+                warnings.append(
+                    "Server Bind Host is non-localhost and Network Password is empty; "
+                    "after restart the app will be reachable on the network without a password."
+                )
+        except Exception:
+            pass
         _repo_slug = current.get("GITHUB_REPO", "")
         _gh_token = current.get("GITHUB_TOKEN", "")
         if _repo_slug and _gh_token:
@@ -1329,9 +1432,32 @@ async def api_command(request: Request) -> JSONResponse:
         body = await request.json()
         cmd = body.get("cmd", "")
         if cmd:
-            from supervisor.message_bus import get_bridge
+            from supervisor.message_bus import get_bridge, log_chat
             bridge = get_bridge()
-            bridge.ui_send(cmd, broadcast=False)
+            visible_text = str(body.get("visible_text") or "").strip()
+            bridge.ui_send(cmd, broadcast=False, suppress_chat_log=bool(visible_text))
+            if visible_text:
+                task_id = str(body.get("visible_task_id") or "skill_repair")
+                ts = datetime.now(timezone.utc).isoformat()
+                payload = {
+                    "type": "chat",
+                    "role": "system",
+                    "content": visible_text,
+                    "ts": ts,
+                    "source": "skill_repair",
+                    "system_type": "skill_repair",
+                    "task_id": task_id,
+                }
+                broadcast_ws_sync(payload)
+                log_chat(
+                    "system",
+                    0,
+                    0,
+                    visible_text,
+                    ts=ts,
+                    source="skill_repair",
+                    task_id=task_id,
+                )
         return JSONResponse({"status": "ok"})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -1380,6 +1506,84 @@ async def api_git_promote(request: Request) -> JSONResponse:
         sp.run(["git", "branch", "-f", branch_stable, branch_dev],
                cwd=str(REPO_DIR), check=True, capture_output=True)
         return JSONResponse({"status": "ok", "message": f"{branch_stable} updated to match {branch_dev}"})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_update_status(request: Request) -> JSONResponse:
+    """Return passive managed-update status without fetching."""
+    try:
+        from supervisor.git_ops import compute_managed_update_status, git_capture
+        status = compute_managed_update_status(fetch=False)
+        latest_version = ""
+        target_ref = status.get("target_ref") or ""
+        if target_ref and status.get("latest_sha"):
+            rc, version_text, _ = git_capture(["git", "show", f"{target_ref}:VERSION"])
+            if rc == 0:
+                latest_version = version_text.strip()
+        return JSONResponse({
+            "current_version": get_version(),
+            "latest_version": latest_version,
+            "official_tags": [],
+            **status,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_update_check(request: Request) -> JSONResponse:
+    """Fetch the managed remote and return fresh update status."""
+    try:
+        from supervisor.git_ops import compute_managed_update_status, git_capture, list_official_update_tags
+        status = compute_managed_update_status(fetch=True)
+        latest_version = ""
+        target_ref = status.get("target_ref") or ""
+        if target_ref and status.get("latest_sha"):
+            rc, version_text, _ = git_capture(["git", "show", f"{target_ref}:VERSION"])
+            if rc == 0:
+                latest_version = version_text.strip()
+        return JSONResponse({
+            "current_version": get_version(),
+            "latest_version": latest_version,
+            "official_tags": list_official_update_tags(),
+            **status,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def api_update_apply(request: Request) -> JSONResponse:
+    """Prepare a managed update and restart so safe_restart applies it."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        strategy = str(body.get("strategy") or "replace")
+        from supervisor.git_ops import BRANCH_DEV, _clear_update_intent, checkout_and_reset, prepare_managed_update
+        ok, payload = prepare_managed_update(strategy)
+        if not ok:
+            return JSONResponse(payload, status_code=409)
+        try:
+            checkout_ok, checkout_msg = checkout_and_reset(
+                BRANCH_DEV,
+                reason="ui_update_apply",
+                unsynced_policy="ignore",
+            )
+        except Exception as checkout_exc:
+            _clear_update_intent()
+            return JSONResponse(
+                {"error": f"Prepared update but checkout failed: {checkout_exc}", **payload},
+                status_code=409,
+            )
+        if not checkout_ok:
+            _clear_update_intent()
+            return JSONResponse(
+                {"error": f"Prepared update but checkout failed: {checkout_msg}", **payload},
+                status_code=409,
+            )
+        _request_restart_exit()
+        return JSONResponse({"status": "ok", "restarting": True, **payload})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1437,11 +1641,14 @@ index_page = make_index_page(web_dir)
 from ouroboros.extensions_api import (
     api_extensions_index,
     api_extension_manifest,
+    api_extension_module,
+    api_extension_settings_section,
     api_extension_dispatch,
     api_skill_toggle,
     api_skill_review,
     api_skill_grants,
     api_skill_reconcile,
+    api_skill_lifecycle_queue,
 )
 from ouroboros.marketplace_api import (
     api_marketplace_search,
@@ -1451,6 +1658,12 @@ from ouroboros.marketplace_api import (
     api_marketplace_update,
     api_marketplace_uninstall,
     api_marketplace_installed,
+    api_ouroboroshub_catalog,
+    api_ouroboroshub_preview,
+    api_ouroboroshub_install,
+    api_ouroboroshub_update,
+    api_ouroboroshub_installed,
+    api_ouroboroshub_uninstall,
 )
 
 
@@ -1532,6 +1745,16 @@ routes = [
         methods=["GET"],
     ),
     Route(
+        "/api/extensions/{skill}/module/{entry}",
+        endpoint=api_extension_module,
+        methods=["GET"],
+    ),
+    Route(
+        "/api/extensions/{skill}/settings_section",
+        endpoint=api_extension_settings_section,
+        methods=["GET"],
+    ),
+    Route(
         "/api/extensions/{skill}/{rest:path}",
         endpoint=api_extension_dispatch,
         methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"],
@@ -1540,6 +1763,11 @@ routes = [
         "/api/skills/{skill}/toggle",
         endpoint=api_skill_toggle,
         methods=["POST"],
+    ),
+    Route(
+        "/api/skills/lifecycle-queue",
+        endpoint=api_skill_lifecycle_queue,
+        methods=["GET"],
     ),
     Route(
         "/api/skills/{skill}/review",
@@ -1592,6 +1820,36 @@ routes = [
         endpoint=api_marketplace_uninstall,
         methods=["POST"],
     ),
+    Route(
+        "/api/marketplace/ouroboroshub/catalog",
+        endpoint=api_ouroboroshub_catalog,
+        methods=["GET"],
+    ),
+    Route(
+        "/api/marketplace/ouroboroshub/installed",
+        endpoint=api_ouroboroshub_installed,
+        methods=["GET"],
+    ),
+    Route(
+        "/api/marketplace/ouroboroshub/preview/{slug:path}",
+        endpoint=api_ouroboroshub_preview,
+        methods=["GET"],
+    ),
+    Route(
+        "/api/marketplace/ouroboroshub/install",
+        endpoint=api_ouroboroshub_install,
+        methods=["POST"],
+    ),
+    Route(
+        "/api/marketplace/ouroboroshub/update/{name}",
+        endpoint=api_ouroboroshub_update,
+        methods=["POST"],
+    ),
+    Route(
+        "/api/marketplace/ouroboroshub/uninstall/{name}",
+        endpoint=api_ouroboroshub_uninstall,
+        methods=["POST"],
+    ),
     # v5: native-skill upgrade migration banner endpoints (Opus
     # critic finding O-2 — operator must be told when a launcher
     # bump silently rewrites an installed skill type).
@@ -1617,6 +1875,9 @@ routes = [
     Route("/api/git/log", endpoint=api_git_log),
     Route("/api/git/rollback", endpoint=api_git_rollback, methods=["POST"]),
     Route("/api/git/promote", endpoint=api_git_promote, methods=["POST"]),
+    Route("/api/update/status", endpoint=api_update_status),
+    Route("/api/update/check", endpoint=api_update_check, methods=["POST"]),
+    Route("/api/update/apply", endpoint=api_update_apply, methods=["POST"]),
     Route("/api/cost-breakdown", endpoint=api_cost_breakdown),
     Route("/api/evolution-data", endpoint=api_evolution_data),
     Route("/api/chat/history", endpoint=api_chat_history),
@@ -1662,6 +1923,12 @@ async def lifespan(app):
     try:
         from ouroboros.launcher_bootstrap import ensure_data_skills_seeded
         ensure_data_skills_seeded()
+        from ouroboros.skill_migrations import (
+            migrate_generation_skill_names,
+            migrate_unseeded_native_skills_to_external,
+        )
+        migrate_unseeded_native_skills_to_external()
+        migrate_generation_skill_names()
     except Exception:
         log.warning("Native skills bootstrap failed", exc_info=True)
 
@@ -1689,6 +1956,8 @@ async def lifespan(app):
             load_settings as _load_settings,
         )
         from ouroboros.extension_loader import reload_all as _reload_extensions
+        from ouroboros.extension_loader import set_ws_broadcaster as _set_extension_ws_broadcaster
+        _set_extension_ws_broadcaster(broadcast_ws_sync)
         repo_path = get_skills_repo_path()
         drive_root = pathlib.Path(DATA_DIR)
         _reload_extensions(drive_root, _load_settings, repo_path=repo_path or None)
@@ -1826,7 +2095,12 @@ def _emergency_process_cleanup() -> None:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> int:
-    args = parse_server_args(DEFAULT_HOST, DEFAULT_PORT)
+    try:
+        saved_host = str(load_settings().get("OUROBOROS_SERVER_HOST") or "").strip()
+    except Exception:
+        saved_host = ""
+    default_host = os.environ.get("OUROBOROS_SERVER_HOST", "").strip() or saved_host or DEFAULT_HOST
+    args = parse_server_args(default_host, DEFAULT_PORT)
     global _BIND_HOST
     _BIND_HOST = args.host
     auth_warning = get_network_auth_startup_warning(args.host)
