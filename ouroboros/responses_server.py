@@ -10,10 +10,8 @@ Routes:
     POST /v1/responses    — main endpoint (streaming or non-streaming)
     GET  /healthz          — liveness check (returns {"ok": true})
 
-Authentication: ``Authorization: Bearer <OUROBOROS_RESPONSES_TOKEN>``.  The
-token is mandatory — the server refuses to start when the gateway is
-enabled but the token is empty (loud failure, mirrors OpenClaw's
-shared-secret model).
+The gateway is unauthenticated.  Bind it to loopback (the default) or
+firewall the port appropriately — there is no shared-secret check.
 
 The HTTP layer here is deliberately thin.  Translation lives in
 ``responses_translator``; bridge dispatch lives in ``responses_executor``;
@@ -87,54 +85,6 @@ def _setup_logging(data_dir: pathlib.Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Auth
-# ---------------------------------------------------------------------------
-
-
-def _expected_token() -> str:
-    return str(os.environ.get("OUROBOROS_RESPONSES_TOKEN", "") or "").strip()
-
-
-def _bearer_from(request: "Request") -> str:
-    raw = request.headers.get("authorization") or request.headers.get("Authorization") or ""
-    raw = raw.strip()
-    if raw.lower().startswith("bearer "):
-        return raw.split(None, 1)[1].strip()
-    return ""
-
-
-def _auth_failure() -> "JSONResponse":
-    return JSONResponse(
-        {"error": {"message": "Missing or invalid bearer token", "type": "authentication_error"}},
-        status_code=401,
-        headers={"WWW-Authenticate": 'Bearer realm="ouroboros-responses"'},
-    )
-
-
-def _check_auth(request: "Request") -> Optional["JSONResponse"]:
-    expected = _expected_token()
-    if not expected:
-        # Server-side misconfiguration — gateway is enabled but no token set.
-        # We refuse all requests rather than serve open-by-default.
-        log.error("OUROBOROS_RESPONSES_TOKEN is empty — refusing every /v1/responses request")
-        return JSONResponse(
-            {"error": {"message": "Gateway not configured (missing token)", "type": "server_error"}},
-            status_code=503,
-        )
-    presented = _bearer_from(request)
-    if not presented:
-        return _auth_failure()
-    if not _constant_time_eq(presented, expected):
-        return _auth_failure()
-    return None
-
-
-def _constant_time_eq(a: str, b: str) -> bool:
-    import hmac
-    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
-
-
-# ---------------------------------------------------------------------------
 # Body parsing
 # ---------------------------------------------------------------------------
 
@@ -199,7 +149,18 @@ def _parse_json_body(body: bytes) -> tuple[Optional[Dict[str, Any]], Optional["R
 # Validation
 # ---------------------------------------------------------------------------
 
-_VALID_MODEL_PREFIX = "openclaw"
+_DEFAULT_MODEL_PREFIX = "ouroboros"
+
+
+def _expected_model_prefix() -> str:
+    """Resolve the gateway's expected model prefix.
+
+    Reads ``OUROBOROS_AGENT_NAME`` from the environment (exported from the
+    same-named setting in ``apply_settings_to_env``); falls back to
+    ``"ouroboros"`` when unset or empty. Compared case-insensitively.
+    """
+    raw = str(os.environ.get("OUROBOROS_AGENT_NAME", "") or "").strip()
+    return (raw or _DEFAULT_MODEL_PREFIX).lower()
 
 
 def _validate_request(payload: Dict[str, Any]) -> Optional["Response"]:
@@ -209,17 +170,18 @@ def _validate_request(payload: Dict[str, Any]) -> Optional["Response"]:
             {"error": {"message": "model is required", "type": "invalid_request_error", "param": "model"}},
             status_code=400,
         )
-    # Accept "openclaw", "openclaw/default", "openclaw/<id>".  Any other value is
-    # rejected so misrouted OpenAI requests fail loudly instead of silently
-    # going through this single-agent gateway.
-    head = model.split("/", 1)[0]
-    if head != _VALID_MODEL_PREFIX:
+    # Accept "<agent>", "<agent>/default", "<agent>/<id>" where ``<agent>`` is
+    # the configured ``OUROBOROS_AGENT_NAME`` (default ``"ouroboros"``).
+    # Comparison is case-insensitive.
+    head = model.split("/", 1)[0].lower()
+    expected = _expected_model_prefix()
+    if head != expected:
         return JSONResponse(
             {"error": {
                 "message": (
                     f"Unsupported model '{model}'. This gateway only serves the "
-                    "Ouroboros agent — use 'openclaw', 'openclaw/default', or "
-                    "'openclaw/<agent>'."
+                    f"agent '{expected}' — use '{expected}', '{expected}/default', "
+                    f"or '{expected}/<subagent>'."
                 ),
                 "type": "invalid_request_error",
                 "param": "model",
@@ -246,10 +208,6 @@ def _validate_request(payload: Dict[str, Any]) -> Optional["Response"]:
 
 
 async def _create_response(request: "Request") -> "Response":
-    auth_err = _check_auth(request)
-    if auth_err is not None:
-        return auth_err
-
     body_bytes, body_err = await _read_body(request)
     if body_err is not None:
         return body_err
@@ -454,23 +412,14 @@ async def start_responses_server(settings: Dict[str, Any]) -> None:
     port = int(settings.get("OUROBOROS_RESPONSES_PORT", 18789) or 18789)
     max_concurrent = int(settings.get("OUROBOROS_RESPONSES_MAX_CONCURRENT", 3) or 3)
     ttl_hours = int(settings.get("OUROBOROS_RESPONSES_SESSION_TTL_HOURS", 24) or 24)
-    token = str(settings.get("OUROBOROS_RESPONSES_TOKEN", "") or "").strip()
 
     _setup_logging(DATA_DIR)
     configure_concurrency(max_concurrent)
-    os.environ["OUROBOROS_RESPONSES_TOKEN"] = token  # so handler reads the same value
-
-    if not token:
-        log.error(
-            "OUROBOROS_RESPONSES_ENABLED is true but OUROBOROS_RESPONSES_TOKEN is empty. "
-            "Set a strong shared secret in Settings → Integrations and restart. "
-            "The gateway will run, but all requests will return 503 until a token is set."
-        )
 
     if host not in ("127.0.0.1", "localhost", "::1"):
         log.warning(
-            "Responses gateway binding to non-loopback host %s — ensure the bearer "
-            "token is strong and the port is firewalled appropriately.",
+            "Responses gateway binding to non-loopback host %s — the gateway is "
+            "unauthenticated; ensure the port is firewalled appropriately.",
             host,
         )
 

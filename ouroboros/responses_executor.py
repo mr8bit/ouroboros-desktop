@@ -127,6 +127,23 @@ class ToolCallCapture:
         self.calls: List[CapturedToolCall] = []
         self._call_index: Dict[str, CapturedToolCall] = {}
         self._lock = threading.Lock()
+        # Token usage captured from the bridge ``task_done`` event.
+        # Populated via ``on_task_done``; surfaced through
+        # ``build_response_object``'s ``usage_input_tokens`` /
+        # ``usage_output_tokens`` kwargs.
+        self.prompt_tokens: int = 0
+        self.completion_tokens: int = 0
+        # Signaled when ``task_done`` is captured so callers can wait briefly
+        # after the assistant's reply is delivered (the two events are
+        # processed back-to-back by the supervisor, but the reply event fires
+        # first).
+        self.task_done_event = threading.Event()
+
+    def on_task_done(self, prompt_tokens: int, completion_tokens: int) -> None:
+        with self._lock:
+            self.prompt_tokens = int(prompt_tokens or 0)
+            self.completion_tokens = int(completion_tokens or 0)
+        self.task_done_event.set()
 
     def on_tool_started(self, tool_call_id: str, name: str, arguments: Any) -> None:
         import json
@@ -250,6 +267,8 @@ async def execute_non_streaming(
         capture=capture,
     )
     tool_calls = list(capture.calls) if capture else []
+    prompt_tokens = capture.prompt_tokens if capture else 0
+    completion_tokens = capture.completion_tokens if capture else 0
     return build_response_object(
         response_id=response_id,
         model=model,
@@ -257,6 +276,8 @@ async def execute_non_streaming(
         tool_calls=tool_calls,
         previous_response_id=previous_response_id,
         user_field=user_field,
+        usage_input_tokens=prompt_tokens,
+        usage_output_tokens=completion_tokens,
     )
 
 
@@ -328,6 +349,8 @@ async def execute_streaming(
         tool_calls=captured,
         previous_response_id=previous_response_id,
         user_field=user_field,
+        usage_input_tokens=capture.prompt_tokens if capture else 0,
+        usage_output_tokens=capture.completion_tokens if capture else 0,
     )
     yield sse_completed(final_obj)
     yield sse_done()
@@ -398,6 +421,11 @@ async def _run_through_bridge(
                 result_preview=str(data.get("result_preview") or ""),
                 is_error=bool(data.get("is_error") or False),
             )
+        elif ev_type == "task_done":
+            capture.on_task_done(
+                prompt_tokens=int(data.get("prompt_tokens") or 0),
+                completion_tokens=int(data.get("completion_tokens") or 0),
+            )
 
     sub_response = bridge.subscribe_response(chat_id, on_response)
     sub_events = bridge.subscribe_chat_events(chat_id, on_chat_event)
@@ -408,6 +436,11 @@ async def _run_through_bridge(
             await asyncio.wait_for(response_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(f"Agent did not respond within {timeout}s")
+        # ``task_done`` (which carries token counts) is processed by the
+        # supervisor right after the assistant reply.  Wait briefly so the
+        # gateway can surface accurate ``usage`` numbers in the response.
+        if capture is not None:
+            await asyncio.to_thread(capture.task_done_event.wait, 2.0)
     finally:
         bridge.unsubscribe_response(sub_response)
         bridge.unsubscribe_chat_events(sub_events)

@@ -260,6 +260,7 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             "type": "task_done",
             "task_id": task_id,
             "task_type": task_type,
+            "chat_id": evt.get("chat_id"),
             "cost_usd": evt.get("cost_usd"),
             "total_rounds": evt.get("total_rounds"),
             "prompt_tokens": evt.get("prompt_tokens"),

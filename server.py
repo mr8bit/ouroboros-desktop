@@ -94,7 +94,6 @@ _SECRET_SETTING_KEYS = {
     "TELEGRAM_BOT_TOKEN",
     "GITHUB_TOKEN",
     "OUROBOROS_NETWORK_PASSWORD",
-    "OUROBOROS_RESPONSES_TOKEN",
 }
 
 # ---------------------------------------------------------------------------

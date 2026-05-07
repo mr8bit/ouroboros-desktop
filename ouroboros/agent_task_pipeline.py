@@ -254,6 +254,7 @@ def emit_task_results(
         "type": "task_done",
         "task_id": task.get("id"),
         "task_type": task.get("type"),
+        "chat_id": task.get("chat_id"),
         "cost_usd": round(float(usage.get("cost") or 0), 6),
         "total_rounds": int(usage.get("rounds") or 0),
         "prompt_tokens": int(usage.get("prompt_tokens") or 0),

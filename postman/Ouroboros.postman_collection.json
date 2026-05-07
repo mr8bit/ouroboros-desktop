@@ -1,0 +1,418 @@
+{
+  "info": {
+    "name": "Ouroboros",
+    "_postman_id": "f4c6c1b1-0c1e-4e8a-9a23-ouroboros000001",
+    "description": "Ouroboros local API: web UI, OpenAI-compatible /v1/responses gateway, and A2A protocol.\n\nDefault hosts assume the docker-compose setup (host port 18790 for /v1/responses; container exposes 18789).\n\nVariables:\n- web_base — http://127.0.0.1:8765\n- responses_base — http://127.0.0.1:18790\n- a2a_base — http://127.0.0.1:18800\n- agent_name — ouroboros (must match OUROBOROS_AGENT_NAME)\n\nThe collection captures runtime values via tests:\n- /v1/responses non-streaming → response_id\n- A2A message/send → task_id, context_id\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "web_base", "value": "http://127.0.0.1:8765", "type": "string" },
+    { "key": "responses_base", "value": "http://127.0.0.1:18790", "type": "string" },
+    { "key": "a2a_base", "value": "http://127.0.0.1:18800", "type": "string" },
+    { "key": "agent_name", "value": "ouroboros", "type": "string" },
+    { "key": "response_id", "value": "", "type": "string" },
+    { "key": "task_id", "value": "", "type": "string" },
+    { "key": "context_id", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health & Web UI",
+      "item": [
+        {
+          "name": "GET /healthz (responses gateway)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{responses_base}}/healthz",
+              "host": ["{{responses_base}}"],
+              "path": ["healthz"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('ok=true', () => pm.expect(pm.response.json().ok).to.eql(true));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "GET / (web UI)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{web_base}}/",
+              "host": ["{{web_base}}"],
+              "path": [""]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('200 OK', () => pm.response.to.have.status(200));"]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "/v1/responses",
+      "item": [
+        {
+          "name": "POST /v1/responses — non-streaming (string input)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{agent_name}}\",\n  \"input\": \"Привет. Скажи одной строкой кто ты.\"\n}"
+            },
+            "url": {
+              "raw": "{{responses_base}}/v1/responses",
+              "host": ["{{responses_base}}"],
+              "path": ["v1", "responses"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('object=response', () => pm.expect(j.object).to.eql('response'));",
+                  "pm.test('status=completed', () => pm.expect(j.status).to.eql('completed'));",
+                  "pm.collectionVariables.set('response_id', j.id);",
+                  "console.log('saved response_id =', j.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/responses — structured input (multi-turn)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{agent_name}}\",\n  \"input\": [\n    {\n      \"role\": \"user\",\n      \"content\": [{ \"type\": \"input_text\", \"text\": \"What is 2+2? Answer with just the number.\" }]\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{responses_base}}/v1/responses",
+              "host": ["{{responses_base}}"],
+              "path": ["v1", "responses"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.expect(j.output_text).to.be.a('string');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/responses — continue session (previous_response_id)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{agent_name}}\",\n  \"previous_response_id\": \"{{response_id}}\",\n  \"input\": \"А теперь повтори свой предыдущий ответ.\"\n}"
+            },
+            "url": {
+              "raw": "{{responses_base}}/v1/responses",
+              "host": ["{{responses_base}}"],
+              "path": ["v1", "responses"]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.collectionVariables.get('response_id')) {",
+                  "  console.warn('response_id is empty — run the non-streaming request first');",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/responses — streaming (SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"{{agent_name}}\",\n  \"input\": \"Считай вслух от 1 до 5.\",\n  \"stream\": true\n}"
+            },
+            "url": {
+              "raw": "{{responses_base}}/v1/responses",
+              "host": ["{{responses_base}}"],
+              "path": ["v1", "responses"]
+            },
+            "description": "Server-Sent Events stream. Postman shows the raw SSE body — look for `event: response.created`, `event: response.output_text.delta`, ending with `data: [DONE]`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.test('content-type is event-stream', () => {",
+                  "  const ct = pm.response.headers.get('Content-Type') || '';",
+                  "  pm.expect(ct).to.include('text/event-stream');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "POST /v1/responses — invalid model (expect 400)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"gpt-4\",\n  \"input\": \"hi\"\n}"
+            },
+            "url": {
+              "raw": "{{responses_base}}/v1/responses",
+              "host": ["{{responses_base}}"],
+              "path": ["v1", "responses"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+                  "pm.test('error.param=model', () => pm.expect(pm.response.json().error.param).to.eql('model'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "A2A Protocol",
+      "item": [
+        {
+          "name": "GET /.well-known/agent.json",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{a2a_base}}/.well-known/agent.json",
+              "host": ["{{a2a_base}}"],
+              "path": [".well-known", "agent.json"]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('has name', () => pm.expect(j.name).to.be.a('string').and.not.empty);",
+                  "pm.test('streaming capability', () => pm.expect(j.capabilities.streaming).to.eql(true));",
+                  "pm.test('preferredTransport=JSONRPC', () => pm.expect(j.preferredTransport).to.eql('JSONRPC'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "JSON-RPC message/send (creates a task)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"req-send-1\",\n  \"method\": \"message/send\",\n  \"params\": {\n    \"message\": {\n      \"role\": \"user\",\n      \"messageId\": \"{{$guid}}\",\n      \"parts\": [\n        { \"kind\": \"text\", \"text\": \"Скажи одной строкой как тебя зовут.\" }\n      ]\n    }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{a2a_base}}/",
+              "host": ["{{a2a_base}}"],
+              "path": [""]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test('jsonrpc=2.0', () => pm.expect(j.jsonrpc).to.eql('2.0'));",
+                  "pm.test('no error', () => pm.expect(j.error).to.be.undefined);",
+                  "if (j.result && j.result.id) {",
+                  "  pm.collectionVariables.set('task_id', j.result.id);",
+                  "  console.log('task_id =', j.result.id);",
+                  "}",
+                  "if (j.result && j.result.contextId) {",
+                  "  pm.collectionVariables.set('context_id', j.result.contextId);",
+                  "  console.log('context_id =', j.result.contextId);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "JSON-RPC tasks/get",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"req-get-1\",\n  \"method\": \"tasks/get\",\n  \"params\": {\n    \"id\": \"{{task_id}}\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{a2a_base}}/",
+              "host": ["{{a2a_base}}"],
+              "path": [""]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.collectionVariables.get('task_id')) {",
+                  "  console.warn('task_id is empty — run message/send first');",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.expect(j.jsonrpc).to.eql('2.0');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "JSON-RPC tasks/cancel",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"req-cancel-1\",\n  \"method\": \"tasks/cancel\",\n  \"params\": {\n    \"id\": \"{{task_id}}\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{a2a_base}}/",
+              "host": ["{{a2a_base}}"],
+              "path": [""]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "JSON-RPC message/stream (SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"req-stream-1\",\n  \"method\": \"message/stream\",\n  \"params\": {\n    \"message\": {\n      \"role\": \"user\",\n      \"messageId\": \"{{$guid}}\",\n      \"parts\": [\n        { \"kind\": \"text\", \"text\": \"Считай от 1 до 5.\" }\n      ]\n    }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{a2a_base}}/",
+              "host": ["{{a2a_base}}"],
+              "path": [""]
+            },
+            "description": "Server-Sent Events. Postman renders the raw SSE body — look for status updates and the final `final: true` event."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

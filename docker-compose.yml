@@ -1,0 +1,62 @@
+services:
+  ouroboros:
+    build: .
+    image: ouroboros-desktop:local
+    container_name: ouroboros
+    restart: unless-stopped
+    ports:
+      - "8765:8765"      # web UI
+      - "18790:18789"    # /v1/responses gateway (host 18790 → container 18789;
+                         # 18789 on host is occupied by another openclaw-gateway)
+      - "18800:18800"    # A2A protocol
+    volumes:
+      - ouroboros-data:/data
+    environment:
+      # --- Storage / app root ---
+      OUROBOROS_APP_ROOT: /data
+      OUROBOROS_DATA_DIR: /data/data
+
+      # --- Web UI ---
+      OUROBOROS_SERVER_HOST: 0.0.0.0
+      OUROBOROS_SERVER_PORT: 8765
+
+      # --- /v1/responses gateway ---
+      OUROBOROS_RESPONSES_ENABLED: "true"
+      OUROBOROS_RESPONSES_HOST: 0.0.0.0
+      OUROBOROS_RESPONSES_PORT: 18789
+      OUROBOROS_AGENT_NAME: ouroboros
+
+      # --- A2A protocol ---
+      A2A_ENABLED: "true"
+      A2A_HOST: 0.0.0.0
+      A2A_PORT: 18800
+      A2A_AGENT_NAME: Ouroboros
+      A2A_AGENT_DESCRIPTION: "Self-modifying AI agent with persistent identity."
+
+      # --- Models (Cloud.ru by default; override via .env) ---
+      OUROBOROS_MODEL: "cloudru::zai-org/GLM-4.7"
+      OUROBOROS_MODEL_CODE: "cloudru::zai-org/GLM-4.7"
+      OUROBOROS_MODEL_LIGHT: "cloudru::zai-org/GLM-4.7"
+      OUROBOROS_MODEL_FALLBACK: "cloudru::zai-org/GLM-4.7"
+      CLOUDRU_FOUNDATION_MODELS_BASE_URL: "https://foundation-models.api.cloud.ru/v1"
+
+      # --- Provider keys (filled from .env at the project root) ---
+      CLOUDRU_FOUNDATION_MODELS_API_KEY: ${CLOUDRU_FOUNDATION_MODELS_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_COMPATIBLE_API_KEY: ${OPENAI_COMPATIBLE_API_KEY:-}
+      OPENAI_COMPATIBLE_BASE_URL: ${OPENAI_COMPATIBLE_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+      # --- Misc ---
+      PYTHONUNBUFFERED: "1"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:18789/healthz', timeout=3); sys.exit(0)"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+volumes:
+  ouroboros-data:

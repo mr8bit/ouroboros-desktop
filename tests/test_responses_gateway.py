@@ -854,10 +854,9 @@ class TestServerHTTP:
     def _client(self, monkeypatch, token: str = "secret"):
         starlette = pytest.importorskip("starlette.testclient", reason="starlette not installed")
         from ouroboros.responses_server import _build_app
-        if token:
-            monkeypatch.setenv("OUROBOROS_RESPONSES_TOKEN", token)
-        else:
-            monkeypatch.delenv("OUROBOROS_RESPONSES_TOKEN", raising=False)
+        # `token` kwarg is retained for call-site compatibility; the gateway
+        # is unauthenticated, so it is ignored.
+        del token
         app = _build_app()
         return starlette.TestClient(app)
 
@@ -872,20 +871,6 @@ class TestServerHTTP:
         resp = client.get("/v1/responses")
         assert resp.status_code == 405
         assert resp.json()["error"]["type"] == "invalid_request_error"
-
-    def test_missing_token_returns_401(self, monkeypatch):
-        client = self._client(monkeypatch, token="secret")
-        resp = client.post("/v1/responses", json={"model": "openclaw", "input": "hi"})
-        assert resp.status_code == 401
-
-    def test_unconfigured_token_returns_503(self, monkeypatch):
-        client = self._client(monkeypatch, token="")
-        resp = client.post(
-            "/v1/responses",
-            json={"model": "openclaw", "input": "hi"},
-            headers={"Authorization": "Bearer anything"},
-        )
-        assert resp.status_code == 503
 
     def test_unknown_model_rejected(self, monkeypatch):
         client = self._client(monkeypatch)
@@ -902,18 +887,40 @@ class TestServerHTTP:
         client = self._client(monkeypatch)
         resp = client.post(
             "/v1/responses",
-            json={"model": "openclaw"},
+            json={"model": "ouroboros"},
             headers={"Authorization": "Bearer secret"},
         )
         assert resp.status_code == 400
         assert resp.json()["error"]["param"] == "input"
+
+    def test_agent_name_override_via_env(self, monkeypatch):
+        """``OUROBOROS_AGENT_NAME`` retargets the model prefix."""
+        monkeypatch.setenv("OUROBOROS_AGENT_NAME", "custombot")
+        client = self._client(monkeypatch)
+        # Old default "ouroboros" must now be rejected.
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "ouroboros", "input": "hi"},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"]["param"] == "model"
+        # The configured name must be accepted (passes validation; bridge
+        # then 500s because no supervisor is running in tests).
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "custombot", "input": "hi"},
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code in (500, 504)
+        assert resp.json()["error"]["type"] == "server_error"
 
     def test_client_tools_rejected_in_v1(self, monkeypatch):
         client = self._client(monkeypatch)
         resp = client.post(
             "/v1/responses",
             json={
-                "model": "openclaw",
+                "model": "ouroboros",
                 "input": "hi",
                 "tools": [{"type": "function", "function": {"name": "x"}}],
             },
@@ -928,7 +935,7 @@ class TestServerHTTP:
         big_input = "x" * 1000
         resp = client.post(
             "/v1/responses",
-            json={"model": "openclaw", "input": big_input},
+            json={"model": "ouroboros", "input": big_input},
             headers={
                 "Authorization": "Bearer secret",
                 "Content-Length": "2000",
@@ -970,29 +977,18 @@ class TestServerHTTP:
         assert resp.status_code == 400
         assert "JSON object" in resp.json()["error"]["message"]
 
-    def test_wrong_token_rejected(self, monkeypatch):
-        client = self._client(monkeypatch, token="real-secret")
-        resp = client.post(
-            "/v1/responses",
-            json={"model": "openclaw", "input": "hi"},
-            headers={"Authorization": "Bearer wrong-secret"},
-        )
-        assert resp.status_code == 401
-        # Standard challenge header per RFC 6750.
-        assert resp.headers.get("WWW-Authenticate", "").startswith("Bearer")
-
     def test_input_must_be_string_or_array(self, monkeypatch):
         client = self._client(monkeypatch)
         resp = client.post(
             "/v1/responses",
-            json={"model": "openclaw", "input": 42},
+            json={"model": "ouroboros", "input": 42},
             headers={"Authorization": "Bearer secret"},
         )
         assert resp.status_code == 400
         assert resp.json()["error"]["param"] == "input"
 
     def test_openclaw_subagent_model_accepted(self, monkeypatch):
-        """`model: openclaw/<id>` must reach validation past model gate.
+        """`model: ouroboros/<id>` must reach validation past model gate.
 
         The bridge dispatch will fail (no supervisor) — we just want to
         confirm the model namespace is honoured.
@@ -1000,7 +996,7 @@ class TestServerHTTP:
         client = self._client(monkeypatch)
         resp = client.post(
             "/v1/responses",
-            json={"model": "openclaw/main", "input": "hi"},
+            json={"model": "ouroboros/main", "input": "hi"},
             headers={"Authorization": "Bearer secret"},
         )
         # 500 (bridge unavailable) is the expected post-validation failure
@@ -1016,7 +1012,7 @@ class TestServerHTTP:
         client = self._client(monkeypatch)
         with client.stream(
             "POST", "/v1/responses",
-            json={"model": "openclaw", "input": "hi", "stream": True},
+            json={"model": "ouroboros", "input": "hi", "stream": True},
             headers={"Authorization": "Bearer secret"},
         ) as resp:
             assert resp.status_code == 200
@@ -1034,7 +1030,7 @@ class TestServerHTTP:
         client = self._client(monkeypatch)
         with client.stream(
             "POST", "/v1/responses",
-            json={"model": "openclaw", "input": "hi", "stream": True},
+            json={"model": "ouroboros", "input": "hi", "stream": True},
             headers={"Authorization": "Bearer secret"},
         ) as resp:
             assert resp.headers.get("x-accel-buffering") == "no"

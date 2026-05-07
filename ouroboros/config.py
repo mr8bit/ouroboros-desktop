@@ -121,7 +121,13 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_RESPONSES_ENABLED": False,
     "OUROBOROS_RESPONSES_HOST": "127.0.0.1",
     "OUROBOROS_RESPONSES_PORT": 18789,
-    "OUROBOROS_RESPONSES_TOKEN": "",
+    "OUROBOROS_AGENT_NAME": "ouroboros",
+    # When set to a positive int, gateways (/v1/responses + A2A) route every
+    # message to that chat_id instead of allocating an isolated virtual one,
+    # so traffic is visible in the web UI chat history. ``0`` = isolated
+    # (default, current behavior). Concurrent gateway clients may interleave
+    # responses on a shared chat_id — single-user only.
+    "OUROBOROS_GATEWAY_CHAT_ID": 0,
     "OUROBOROS_RESPONSES_MAX_CONCURRENT": 3,
     "OUROBOROS_RESPONSES_SESSION_TTL_HOURS": 24,
     "OUROBOROS_RESPONSES_FILES_MAX_BYTES": 5_000_000,
@@ -809,7 +815,8 @@ def apply_settings_to_env(settings: dict) -> None:
         "A2A_AGENT_NAME", "A2A_AGENT_DESCRIPTION",
         "A2A_MAX_CONCURRENT", "A2A_TASK_TTL_HOURS",
         "OUROBOROS_RESPONSES_ENABLED", "OUROBOROS_RESPONSES_HOST",
-        "OUROBOROS_RESPONSES_PORT", "OUROBOROS_RESPONSES_TOKEN",
+        "OUROBOROS_RESPONSES_PORT", "OUROBOROS_AGENT_NAME",
+        "OUROBOROS_GATEWAY_CHAT_ID",
         "OUROBOROS_RESPONSES_MAX_CONCURRENT",
         "OUROBOROS_RESPONSES_SESSION_TTL_HOURS",
         "OUROBOROS_RESPONSES_FILES_MAX_BYTES",
